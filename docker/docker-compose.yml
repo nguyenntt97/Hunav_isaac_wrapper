@@ -1,0 +1,47 @@
+services:
+  hunav-sim:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        # Override with: BASE_IMAGE=isaac-lab-base-go2:latest docker compose build
+        BASE_IMAGE: ${BASE_IMAGE:-nvcr.io/nvidia/isaac-lab:3.0.0-beta2-post1}
+    image: hunav-isaac-jazzy:3.0
+    container_name: hunav_isaac_sim
+    runtime: nvidia
+    network_mode: host      # Essential for ROS 2 DDS communication with host/other nodes
+    ipc: host
+    privileged: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - ACCEPT_EULA=Y
+      - DISPLAY=${DISPLAY}
+      - HEADLESS=${HEADLESS:-false}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
+    volumes:
+      # X11 GUI forward
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      # Project workspace mount (live code editing)
+      - ../:/workspace/Hunav_isaac_wrapper:rw
+      # Persistent Omniverse & Shader cache (avoids redownloading human characters every run)
+      - ov-cache:/root/.cache/ov
+      - ov-data:/root/.local/share/ov/data
+      - nv-glcache:/root/.cache/nvidia/GLCache
+
+    stdin_open: true
+    tty: true
+    working_dir: /workspace/Hunav_isaac_wrapper
+    command: /bin/bash
+
+volumes:
+  ov-cache:
+  ov-data:
+  nv-glcache:
