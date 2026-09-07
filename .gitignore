@@ -13,3 +13,6 @@ __pycache__/
 *.tmp
 *.swp
 *~  
+
+*.usd
+*.etli
