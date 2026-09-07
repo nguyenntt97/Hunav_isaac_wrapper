@@ -7,6 +7,7 @@ setting up animations (including retargeting), and handling physics.
 """
 
 import os
+import os as _os
 import math
 import random
 import yaml
@@ -32,8 +33,15 @@ import carb
 
 # Import auxiliary animation functions
 from .animation_utils import *
+from .asset_paths import biped_setup_url
 
+# These are requested at app startup via SimulationApp's extra_args (see
+# ANIM_EXTENSIONS in teleop_hunav_sim.py), which is the only point at which
+# omni.anim.graph.core initialises its CharacterManager. The calls below are
+# no-ops in that path and only matter when HuNavManager is imported into an app
+# that was started some other way.
 enable_extension("omni.anim.retarget.core")
+enable_extension("omni.anim.graph.core")
 
 import omni.anim.graph.core as ag
 
@@ -121,10 +129,10 @@ class HuNavManager:
         else:
             self.config = None
 
-        # Define the default character source asset (for animation retargeting)
-        self.default_biped_usd = os.path.join(
-            self.assets_root, "Isaac/People/Characters/Biped_Setup.usd"
-        )
+        # Define the default character source asset (for animation retargeting).
+        # Removed from the Isaac Sim 5.0+ buckets, so this may resolve against
+        # the 4.5 bucket -- see asset_paths.biped_setup_url.
+        self.default_biped_usd = biped_setup_url(self.assets_root)
 
     def _load_yaml(self, relative_path):
         full_path = os.path.join(os.path.dirname(__file__), relative_path)
@@ -186,7 +194,30 @@ class HuNavManager:
             value -= 2 * math.pi
         return value
 
+    @staticmethod
+    def _ros_subprocess_env():
+        """
+        Environment for the HuNavSim ROS 2 nodes we spawn.
+
+        They are launched from inside Isaac Sim's interpreter, so they would
+        otherwise inherit Isaac's PYTHONPATH. Python nodes (hunav_evaluator)
+        then import Isaac's bundled numpy while their own extension modules
+        (pandas) were built against the system numpy, aborting with
+        "numpy.dtype size changed ... binary incompatibility". Strip the Isaac
+        entries so the nodes resolve the system/ROS site-packages instead.
+        """
+        env = os.environ.copy()
+        isaac_root = os.environ.get("ISAAC_PATH", "/isaac-sim")
+        pythonpath = [
+            entry
+            for entry in env.get("PYTHONPATH", "").split(os.pathsep)
+            if entry and not entry.startswith(isaac_root)
+        ]
+        env["PYTHONPATH"] = os.pathsep.join(pythonpath)
+        return env
+
     def initialize_hunav_nodes(self):
+        env = self._ros_subprocess_env()
         process_1 = subprocess.Popen(
             [
                 "ros2",
@@ -198,6 +229,7 @@ class HuNavManager:
                 self.config_file_path,
             ],
             preexec_fn=os.setsid,
+            env=env,
         )
         process_2 = subprocess.Popen(
             [
@@ -210,18 +242,24 @@ class HuNavManager:
                 self.config_file_path,
             ],
             preexec_fn=os.setsid,
+            env=env,
         )
         process_3 = subprocess.Popen(
             ["ros2", "run", "hunav_evaluator", "hunav_evaluator_node"],
             preexec_fn=os.setsid,
+            env=env,
         )
 
-        self._hunav_processes = [process_1, process_2] #, process_3]
+        self._hunav_processes = [process_1, process_2, process_3]
 
     def close_hunav_nodes(self):
         for process in self._hunav_processes:
             print(process)
-            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError) as e:
+                # Already exited (e.g. a node whose package is not built).
+                print(f"[HuNavManager] could not signal pid {process.pid}: {e}")
         self._hunav_processes = []
 
     def initialize_agents(self):
@@ -365,6 +403,7 @@ class HuNavManager:
                     self.source_animation_dict,
                     self.target_animation_parent_path,
                 )
+                self._verify_retargeted_animations()
                 self.retarget_flag = True
 
             # Create and apply AnimationGraph
@@ -399,6 +438,27 @@ class HuNavManager:
                 )
         else:
             print("[HuNavManager] no robot_prim_path provided")
+
+    def _verify_retargeted_animations(self):
+        """
+        Confirm retargeting actually produced the clips the AnimationGraphs bind to.
+
+        setup_anim_retargeting() returns quietly when the source biped is missing
+        (e.g. Biped_Setup.usd absent from the asset bucket), which would otherwise
+        leave every agent gliding to its goal with no walk cycle and no error.
+        """
+        missing = [
+            path
+            for path in self.retarget_anims_path
+            if not self.stage.GetPrimAtPath(path).IsValid()
+        ]
+        if missing:
+            raise RuntimeError(
+                "Animation retargeting produced no clips at "
+                f"{missing}. The source biped ({self.default_biped_usd}) failed to "
+                "load or has no skeleton -- agents would not animate. Check that "
+                "the URL is reachable and that omni.anim.retarget.core is enabled."
+            )
 
     def reset_agent_states(self):
         for agent, init_state in zip(self.agents, self.agent_initial_states):
@@ -541,8 +601,17 @@ class HuNavManager:
         robot.group_id = 0
         robot.radius = 0.5
         robot.desired_velocity = 1.0
-        robot.linear_vel = np.sqrt(lin_vel[0] ** 2 + lin_vel[1] ** 2 + lin_vel[2] ** 2)
-        robot.angular_vel = np.sqrt(ang_vel[0] ** 2 + ang_vel[1] ** 2 + ang_vel[2] ** 2)
+        # float() is mandatory, not cosmetic: rosidl's generated C asserts
+        # PyFloat_Check on these fields, and get_linear_velocity()/
+        # get_angular_velocity() return backend-dependent scalars (numpy or
+        # torch, depending on the isaacsim.core backend) that fail that check
+        # and abort the process. _create_agent_msg() already does this.
+        robot.linear_vel = float(
+            np.sqrt(lin_vel[0] ** 2 + lin_vel[1] ** 2 + lin_vel[2] ** 2)
+        )
+        robot.angular_vel = float(
+            np.sqrt(ang_vel[0] ** 2 + ang_vel[1] ** 2 + ang_vel[2] ** 2)
+        )
 
         # Pose
         robot.position.position.x = float(pos[0])
@@ -553,7 +622,7 @@ class HuNavManager:
         robot.position.orientation.y = float(quat[2])
         robot.position.orientation.z = float(quat[3])
         _, _, yaw = self.euler_from_quaternion(quat[1], quat[2], quat[3], quat[0])
-        robot.yaw = yaw
+        robot.yaw = float(yaw)
 
         # Velocities
         robot.velocity.linear.x = float(lin_vel[0])
@@ -600,7 +669,7 @@ class HuNavManager:
         _, _, yaw = self.euler_from_quaternion(
             float(rx), float(ry), float(rz), float(rw)
         )
-        agent.yaw = self.normalize_angle(yaw - math.pi / 2.0)
+        agent.yaw = float(self.normalize_angle(yaw - math.pi / 2.0))
 
         # Velocities
         lin = agent_prim.GetAttribute("physics:velocity").Get()
@@ -797,8 +866,13 @@ class HuNavManager:
                 upd.velocity.linear.z,
             )
 
-            # Animation orientation correction (use smoothed animation orientation)
-            if char:
+            # Animation orientation correction (use smoothed animation orientation).
+            # HUNAV_DRIVE_CHARACTER=0 disables this: the character prim is a child
+            # of the container Xform that was just placed at new_pos, so once the
+            # AnimationGraph actually compiles and the character is live, setting
+            # its world transform here composes with the parent and the agent
+            # accelerates away from the map.
+            if char and _os.environ.get("HUNAV_DRIVE_CHARACTER", "1") != "0":
                 pos_carb = carb.Float3(new_pos[0], new_pos[1], new_pos[2])
                 real = smoothed_anim_quat.GetReal()
                 imag = smoothed_anim_quat.GetImaginary()

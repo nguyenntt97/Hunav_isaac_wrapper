@@ -38,7 +38,9 @@ workspace_root = os.path.dirname(src_dir)
 
 # Try to detect source directory locations
 SOURCE_PATHS = [
-    "/workspace/hunav_isaac_ws/src/Hunav_isaac_wrapper/src",  # Docker container
+    "/workspace/Hunav_isaac_wrapper/src",  # Container repository path
+    "/workspace/hunav_ws/src/hunav_isaac_wrapper",  # Colcon workspace symlink
+    "/workspace/hunav_isaac_ws/src/Hunav_isaac_wrapper/src",  # Legacy docker path
     os.path.join(os.path.expanduser("~"), "Hunav_isaac_wrapper"),  # Home directory
     os.path.join(workspace_root, "src"),  # Colcon workspace src directory
 ]
@@ -71,11 +73,26 @@ if not source_found:
             install_idx = parts.index("install")
             possible_workspace = os.sep.join(parts[:install_idx])
             possible_src = os.path.join(possible_workspace, "src", "scenarios")
+            possible_src_pkg = os.path.join(possible_workspace, "src", "hunav_isaac_wrapper", "scenarios")
+            possible_share = os.path.join(possible_workspace, "install", "hunav_isaac_wrapper", "share", "hunav_isaac_wrapper", "scenarios")
             if os.path.isdir(possible_src):
                 BASE_WRAPPER = os.path.join(possible_workspace, "src")
                 CONFIG_DIR = possible_src
                 WORLDS_DIR = os.path.join(possible_workspace, "src", "worlds")
                 CONFIG_CONFIG_DIR = os.path.join(possible_workspace, "src", "config")
+                source_found = True
+            elif os.path.isdir(possible_src_pkg):
+                BASE_WRAPPER = os.path.join(possible_workspace, "src", "hunav_isaac_wrapper")
+                CONFIG_DIR = possible_src_pkg
+                WORLDS_DIR = os.path.join(BASE_WRAPPER, "worlds")
+                CONFIG_CONFIG_DIR = os.path.join(BASE_WRAPPER, "config")
+                source_found = True
+            elif os.path.isdir(possible_share):
+                BASE_WRAPPER = os.path.dirname(possible_share)
+                CONFIG_DIR = possible_share
+                WORLDS_DIR = os.path.join(BASE_WRAPPER, "worlds")
+                CONFIG_CONFIG_DIR = os.path.join(BASE_WRAPPER, "config")
+                source_found = True
             else:
                 # Fall back to share directory only if source not found
                 current_dir = os.getcwd()
@@ -522,6 +539,7 @@ def interactive_config_selection():
     last_config = load_last_config()
     
     # --- top‐level mode selection ---
+    rviz_process = None
     while True:
         # Build mode choices dynamically based on whether we have a last config
         mode_choices = []
@@ -583,10 +601,12 @@ def interactive_config_selection():
                     if restart_choice in ['y', 'yes']:
                         print_info("Stopping existing RViz2 panel instances...")
                         
-                        # Kill existing processes more thoroughly
+                        # Kill existing processes more thoroughly. These were started
+                        # by an earlier run, so there is no Popen handle for them --
+                        # signal the PIDs pgrep reported.
                         try:
                             # First try graceful termination
-                            os.killpg(os.getpgid(rviz_process.pid), signal.SIGTERM)
+                            subprocess.run(["pkill", "-f", "hunav_rviz2_launch"])
                             print_info("Sent termination signal, waiting for processes to stop...")
                             time.sleep(1)
                             
@@ -599,7 +619,7 @@ def interactive_config_selection():
                             
                             if check_result.returncode == 0:
                                 print_warning("Some processes still running, forcing termination...")
-                                os.killpg(os.getpgid(rviz_process.pid), signal.SIGKILL)
+                                subprocess.run(["pkill", "-9", "-f", "hunav_rviz2_launch"])
                                 time.sleep(2)
                                 
                                 # Final check

@@ -61,12 +61,6 @@ install(DIRECTORY behavior_trees/
   DESTINATION share/${PROJECT_NAME}/behavior_trees
 )
 
-# Install other files
-install(FILES
-  isaacsim.exp.base.kit
-  DESTINATION share/${PROJECT_NAME}
-)
-
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   # the following line skips the linter which checks for copyrights

@@ -10,9 +10,13 @@ This repository is actively developed and subject to improvements.
 
 ### ✅ **Tested Configurations**  
 
-- **ROS 2 Humble**  
-- **Isaac Sim 4.5**  
-- **Ubuntu 22.04 LTS**  
+- **ROS 2 Humble** + **Isaac Sim 4.5** + **Ubuntu 22.04 LTS**  
+- **ROS 2 Jazzy** + **Isaac Sim 6.0** + **Ubuntu 24.04 LTS** (see `docker/`)  
+
+Isaac Sim 5.0 reorganised the asset buckets and moved several extensions out of the
+default app. Version-sensitive asset paths are resolved at runtime by
+`src/hunav_isaac_wrapper/asset_paths.py`; the required animation extensions are enabled
+at runtime by `hunav_manager.py`. No manual Isaac Sim configuration is needed.
 
 ## 🔹 **Overview**  
 
@@ -62,13 +66,16 @@ It supports both **ROS 2 teleoperation** and **autonomous navigation (Nav2)**, w
 
 ## 🔹 **Requirements**
 
-- **Ubuntu 22.04 LTS**
+- **Ubuntu 22.04 LTS** or **24.04 LTS**
 - [**HuNavSim**](https://github.com/robotics-upo/hunav_sim)
-- [**NVIDIA Isaac Sim (Workstation Installation)**](https://docs.isaacsim.omniverse.nvidia.com/latest/installation/install_workstation.html)
+- [**NVIDIA Isaac Sim (Workstation Installation)**](https://docs.isaacsim.omniverse.nvidia.com/latest/installation/install_workstation.html) — 4.5 or 5.0+
 
 - **Python 3.8+**  
 
-- **ROS 2 **[Humble](https://docs.ros.org/en/humble/Installation/Ubuntu-Install-Debians.html)****  
+- **ROS 2** [Humble](https://docs.ros.org/en/humble/Installation/Ubuntu-Install-Debians.html) or [Jazzy](https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debians.html)  
+
+- Network access to the Isaac Sim asset bucket (characters, animations and the
+  retargeting source skeleton are streamed, not bundled).
 
 ---
 
@@ -130,23 +137,23 @@ cd .. && colcon build
 
 Make sure you have **NVIDIA Isaac Sim** installed. Follow the [Isaac Sim Installation Guide](https://docs.isaacsim.omniverse.nvidia.com/latest/installation/install_workstation.html).
 
-### 3. Configure Isaac Sim Extensions
+### 3. Isaac Sim Extensions
 
-To ensure all required dependencies are active, replace the existing `isaacsim.exp.base.kit` file from your Isaac Sim installation with the one provided in this repository:
+Nothing to do. `hunav_manager.py` enables `omni.anim.retarget.core` and
+`omni.anim.graph.core` at startup via `enable_extension()`.
 
-```bash
-# After cloning this repository
-cp src/isaacsim.exp.base.kit ~/isaacsim/apps/
-```
-
-⚠️ **Important**: This file ensures that essential extensions (e.g., animation retargeting, ROS 2 bridge) are preloaded at startup.
+⚠️ Earlier revisions of this README told you to copy `src/isaacsim.exp.base.kit` over the
+one in your Isaac Sim installation. **Do not do this.** That file targets Isaac Sim 4.5;
+31 of its 119 extension dependencies (the whole legacy `omni.isaac.*` family,
+`isaacsim.asset.browser`, `omni.kit.loop-isaac`, …) do not exist in 5.0+, and copying it
+prevents the app from starting.
 
 ### 4. ROS 2 Setup
 
-Ensure ROS 2 Humble is installed and sourced:
+Ensure ROS 2 is installed and sourced:
 
 ```bash
-source /opt/ros/humble/setup.bash
+source /opt/ros/jazzy/setup.bash    # or /opt/ros/humble/setup.bash
 ```
 
 ### 5. Configure Your Scene, Agents, and Robot
@@ -183,7 +190,12 @@ Each world is paired with a YAML file in `src/scenarios/` that defines the HuNav
 The interactive launcher will prompt you to select your desired robot:
 - `jetbot`, `create3`, `carter`, or `carter_ROS`
 
-**Note:** For `carter_ROS`, make sure to unzip the `nova_carter_ros2_sensors` package located in `src/config/robots/`.
+**Note:** For `carter_ROS`, make sure to unzip the `nova_carter_ros2_sensors` package located in `src/config/robots/`. (The Docker entrypoint does this for you.)
+
+**Note:** `carter` is **Isaac Sim 4.5 only**. It used `Isaac/Robots/Carter/nova_carter_sensors.usd`,
+which has no sensor-equipped equivalent in the 5.0+ asset buckets. On 5.0+ use `carter_ROS`,
+which is backed by the USD bundled in this repository; selecting `carter` there fails with
+an explicit error rather than a 404.
 
 **Carter** robot also supports **ROS 2 Navigation (Nav2)** for autonomous navigation.
 

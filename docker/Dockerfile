@@ -33,10 +33,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ros-jazzy-tf-transformations \
     ros-jazzy-nav2-behavior-tree \
     ros-jazzy-behaviortree-cpp \
+    ros-jazzy-angles \
+    ros-jazzy-nav2-util \
+    ros-jazzy-nav2-msgs \
+    ros-jazzy-resource-retriever \
+    ros-jazzy-rviz2 \
+    ros-jazzy-rviz-common \
+    ros-jazzy-rviz-default-plugins \
+    ros-jazzy-rviz-ogre-vendor \
+    ros-jazzy-rviz-rendering \
+    qtbase5-dev \
     python3-colcon-common-extensions \
     python3-yaml \
     python3-numpy \
     python3-matplotlib \
+    python3-pandas \
     && rm -rf /var/lib/apt/lists/*
 
 # 2. Install lightsfm (header-only Social Force Model lib required by
@@ -66,7 +77,9 @@ RUN cd hunav_sim/hunav_agent_manager \
 
 WORKDIR /workspace/hunav_ws
 RUN /bin/bash -c "source /opt/ros/jazzy/setup.bash && \
-    colcon build --packages-select people_msgs hunav_msgs hunav_agent_manager"
+    colcon build --packages-select people_msgs hunav_msgs hunav_agent_manager \
+                                  hunav_evaluator hunav_behavior_tree_generator \
+                                  hunav_rviz2_panel"
 
 # 4. Setup Entrypoint script
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh

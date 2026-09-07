@@ -44,30 +44,38 @@ fi
 echo -e "${GREEN}HuNav Isaac Wrapper Launcher${NC}"
 echo "Using script: $MAIN_SCRIPT"
 
-# Check if Isaac Sim python is available
+# Check if Isaac Sim python is available.
+# Order matches find_isaac_python() in src/hunav_isaac_wrapper/ros_launcher.py:
+# container install first, then workstation install, then the AppImage layout.
 ISAAC_PYTHON=""
-ISAAC_SIM_PATH="$HOME/isaacsim/python.sh"
-if [ -f "$ISAAC_SIM_PATH" ]; then
-    ISAAC_PYTHON="bash $ISAAC_SIM_PATH"
+if [ -f "/isaac-sim/python.sh" ]; then
+    ISAAC_PYTHON="bash /isaac-sim/python.sh"
     echo "Using Isaac Sim python: $ISAAC_PYTHON"
-elif [ -f "$HOME/.local/share/ov/pkg/isaac_sim-"*/python.sh ]; then
+elif [ -f "$HOME/isaacsim/python.sh" ]; then
+    ISAAC_PYTHON="bash $HOME/isaacsim/python.sh"
+    echo "Using Isaac Sim python: $ISAAC_PYTHON"
+else
     ISAAC_SIM_PATH=$(ls "$HOME/.local/share/ov/pkg/isaac_sim-"*/python.sh 2>/dev/null | head -1)
-    if [ -f "$ISAAC_SIM_PATH" ]; then
+    if [ -n "$ISAAC_SIM_PATH" ] && [ -f "$ISAAC_SIM_PATH" ]; then
         ISAAC_PYTHON="bash $ISAAC_SIM_PATH"
         echo "Using Isaac Sim python: $ISAAC_PYTHON"
+    elif command -v isaacsim &> /dev/null; then
+        ISAAC_PYTHON="isaacsim"
+        echo "Using Isaac Sim python: $ISAAC_PYTHON"
     fi
-elif command -v isaacsim &> /dev/null; then
-    ISAAC_PYTHON="isaacsim"
-    echo "Using Isaac Sim python: $ISAAC_PYTHON"
 fi
 
 if [ -z "$ISAAC_PYTHON" ]; then
-    echo -e "${YELLOW}Warning: Isaac Sim python not found.${NC}"
-    echo -e "${YELLOW}Falling back to system python3. Some Isaac Sim features may not work.${NC}"
-    echo -e "${YELLOW}For best results, please install Isaac Sim and source its environment.${NC}"
+    echo -e "${YELLOW}Error: Isaac Sim python not found.${NC}"
+    echo "Searched:"
+    echo "  /isaac-sim/python.sh"
+    echo "  $HOME/isaacsim/python.sh"
+    echo "  $HOME/.local/share/ov/pkg/isaac_sim-*/python.sh"
+    echo "  isaacsim on PATH"
     echo ""
-    ISAAC_PYTHON="python3"
-    echo "Using system python: $ISAAC_PYTHON"
+    echo "The simulation cannot run under the system python3 -- 'from isaacsim import"
+    echo "SimulationApp' is only importable from Isaac Sim's own interpreter."
+    exit 1
 fi
 
 # Parse arguments

@@ -88,6 +88,18 @@ def create_agent_animation_graph(stage, agent_prim, idle_anim_path, walk_anim_pa
     graph_path = Sdf.Path(f"{str(agent_prim.GetPath())}/AnimationGraph")
     anim_graph_prim = stage.DefinePrim(graph_path, "AnimationGraph")
 
+    # Declare the 'speed' graph variable up front. The ReadVariable node below
+    # resolves it when omni.anim.asset compiles the graph at play time, which
+    # happens before any call to set_anim_graph_speed(); if the variable is not
+    # declared by then the whole graph fails to compile ("Failed to compile
+    # asset .../AnimationGraph") and the agent never animates.
+    anim_graph_prim.CreateAttribute(
+        "anim:graph:variable:speed",
+        Sdf.ValueTypeNames.Float,
+        custom=True,
+        variability=Sdf.VariabilityUniform,
+    ).Set(0.0)
+
     # Create and configure child nodes:
     # Blend node
     blend_path = graph_path.AppendChild("Blend")
@@ -174,7 +186,7 @@ def setup_anim_retargeting(
         target_skeleton_path=target_skel_str,
         source_animation_paths=[source_anim_path],
         target_animation_parent_path=target_animation_parent_path,
-        set_root_identity=False,
+        set_root_identity=True,
     )
     omni.kit.commands.execute(
         "CreateRetargetAnimationsCommand",
@@ -182,7 +194,7 @@ def setup_anim_retargeting(
         target_skeleton_path=target_skel_str,
         source_animation_paths=[str(source_animation_dict[0])],
         target_animation_parent_path=target_animation_parent_path,
-        set_root_identity=False,
+        set_root_identity=True,
     )
 
 
@@ -202,9 +214,8 @@ def set_anim_graph_speed(stage, anim_graph_character, graph_path, speed_value):
         print(f"set_anim_graph_speed: AnimationGraph prim not found at {graph_path}")
         return
 
-    speed_attr = graph_prim.GetAttribute("anim:graph:variable:speed")
-    if not speed_attr or not speed_attr.IsValid():
-        speed_attr = graph_prim.CreateAttribute(
-            "anim:graph:variable:speed", Sdf.ValueTypeNames.Float, custom=True
-        )
-    anim_graph_character.set_variable("speed", speed_value)
+    # The attribute is declared in create_agent_animation_graph(); creating it
+    # here would be too late for the graph compiler.
+    if anim_graph_character is None:
+        return
+    anim_graph_character.set_variable("speed", float(speed_value))

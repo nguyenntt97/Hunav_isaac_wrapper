@@ -40,7 +40,7 @@ setup(
         
         # Install other files
         (os.path.join('share', package_name),
-            ['README.md', 'isaacsim.exp.base.kit']),
+            ['README.md']),
     ],
     install_requires=[
         'setuptools',
