@@ -51,9 +51,13 @@ install(DIRECTORY maps/
   DESTINATION share/${PROJECT_NAME}/maps
 )
 
-# Install world files
+# Install world files.
+# FILES_MATCHING keeps the Collected_* texture bundles (~1 GB) that sit alongside
+# the .usd files out of the install space. The stages reference those textures by
+# absolute path into the source tree, so they still resolve from the installed copy.
 install(DIRECTORY worlds/
   DESTINATION share/${PROJECT_NAME}/worlds
+  FILES_MATCHING PATTERN "*.usd"
 )
 
 # Install behavior tree files

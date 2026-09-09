@@ -11,6 +11,19 @@ import os as _os
 
 from isaacsim import SimulationApp
 
+def _env_flag(name, default="false"):
+    return _os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+# LIVESTREAM=1 serves the viewport over WebRTC instead of opening a local window,
+# for running without an X display (signalling port 49100, media port 47998).
+# It implies headless, but unlike plain headless the UI is kept so the remote
+# client has something to drive.
+LIVESTREAM = _env_flag("LIVESTREAM") or _os.environ.get(
+    "LIVESTREAM", ""
+).strip().lower() == "webrtc"
+
+
 # Extensions this wrapper needs that the stock isaacsim.exp.base.kit stopped
 # depending on after Isaac Sim 4.5. This is exactly the set the 4.5-era
 # isaacsim.exp.base.kit in this repo used to supply; requesting them here means
@@ -41,18 +54,27 @@ _ENABLE_ARGS = []
 for _ext in STARTUP_EXTENSIONS:
     _ENABLE_ARGS += ["--enable", _ext]
 
+if LIVESTREAM:
+    # Must be enabled at startup, not after SimulationApp() returns. Isaac Sim's
+    # own streaming launcher lists omni.kit.livestream.app in the [dependencies]
+    # of isaacsim.exp.full.streaming.kit so it initialises alongside the
+    # renderer. Enabling it later leaves the renderer already up in --no-window
+    # mode with no surface, and it spins logging
+    # "advanceCurrentFrame: backbuffers are not initialized!" while the client
+    # sees a black screen.
+    _ENABLE_ARGS += ["--enable", "omni.kit.livestream.app"]
+    _LS = "--/exts/omni.kit.livestream.app/primaryStream"
+    _ENABLE_ARGS += [
+        f"{_LS}/streamType=webrtc",
+        f"{_LS}/signalPort=49100",
+        f"{_LS}/streamPort=47998",
+    ]
+    _ip = _os.environ.get("LIVESTREAM_PUBLIC_IP", "").strip()
+    if _ip:
+        _ENABLE_ARGS += [f"{_LS}/publicIp={_ip}"]
 
-def _env_flag(name, default="false"):
-    return _os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
 
 
-# LIVESTREAM=1 serves the viewport over WebRTC instead of opening a local window,
-# for running without an X display (signalling port 49100, media port 47998).
-# It implies headless, but unlike plain headless the UI is kept so the remote
-# client has something to drive.
-LIVESTREAM = _env_flag("LIVESTREAM") or _os.environ.get(
-    "LIVESTREAM", ""
-).strip().lower() == "webrtc"
 
 # Start Isaac Sim. HEADLESS is already plumbed through docker/docker-compose.yml.
 CONFIG = {
@@ -73,22 +95,8 @@ if LIVESTREAM:
 simulation_app = SimulationApp(CONFIG)
 
 if LIVESTREAM:
-    from isaacsim.core.utils.extensions import enable_extension as _enable_extension
-
     simulation_app.set_setting("/app/window/drawMouse", True)
-
-    # The signalling socket binds to 0.0.0.0, but WebRTC advertises ICE
-    # candidates for the media stream and auto-detection picks badly on a
-    # multi-homed host (docker bridges, VPN interfaces). Symptom is a client
-    # that connects and then shows no video. Pin the address the client should
-    # actually reach us on, e.g. LIVESTREAM_PUBLIC_IP=192.168.11.2
     _public_ip = _os.environ.get("LIVESTREAM_PUBLIC_IP", "").strip()
-    if _public_ip:
-        simulation_app.set_setting(
-            "/exts/omni.kit.livestream.app/primaryStream/publicIp", _public_ip
-        )
-
-    _enable_extension("omni.kit.livestream.app")
     print(
         "\n[hunav] WebRTC livestream enabled -- connect the Isaac Sim WebRTC "
         f"Streaming Client to {_public_ip or '<host>'}:49100 (media UDP 47998)."
@@ -120,6 +128,18 @@ from .asset_paths import (
     is_robot_available,
     robot_usd_relative_path,
 )
+
+# Where the robot is spawned, per world. The origin works for the indoor worlds,
+# but brownstone has several coincident ground meshes stacked at z=0 around
+# (0, 0) -- pathway, hardscape and sidewalk all with exact triangle-mesh
+# colliders. PhysX resolves that degenerate contact by launching the robot
+# (measured: ejected at ~23 m/s, 115 m away within 5 s). Anywhere else on the
+# park's path network is stable, so brownstone spawns off-origin instead.
+DEFAULT_ROBOT_SPAWN = [0.0, 0.0, 0.0]
+ROBOT_SPAWN_POSE = {
+    "brownstone": [4.0, -43.0, 0.25],
+}
+
 
 def find_package_share_directory():
     """
@@ -307,7 +327,7 @@ class TeleopHuNavSim(Node):
                 wheel_dof_names=robot_config["wheel_dof_names"],
                 create_robot=True,
                 usd_path=robot_path,
-                position=[0.0, 0.0, 0.0],
+                position=ROBOT_SPAWN_POSE.get(map_name, DEFAULT_ROBOT_SPAWN),
                 orientation=[0, 0, 0, 1],
             )
         )

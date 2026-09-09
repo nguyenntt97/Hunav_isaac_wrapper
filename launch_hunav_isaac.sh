@@ -55,14 +55,15 @@ elif [ -f "$HOME/isaacsim/python.sh" ]; then
     ISAAC_PYTHON="bash $HOME/isaacsim/python.sh"
     echo "Using Isaac Sim python: $ISAAC_PYTHON"
 else
-    ISAAC_SIM_PATH=$(ls "$HOME/.local/share/ov/pkg/isaac_sim-"*/python.sh 2>/dev/null | head -1)
-    if [ -n "$ISAAC_SIM_PATH" ] && [ -f "$ISAAC_SIM_PATH" ]; then
-        ISAAC_PYTHON="bash $ISAAC_SIM_PATH"
-        echo "Using Isaac Sim python: $ISAAC_PYTHON"
-    elif command -v isaacsim &> /dev/null; then
-        ISAAC_PYTHON="isaacsim"
-        echo "Using Isaac Sim python: $ISAAC_PYTHON"
-    fi
+    echo "Isaac Sim python not found in standard locations. Searching for AppImage layout..."
+    # ISAAC_SIM_PATH=$(ls "$HOME/.local/share/ov/pkg/isaac_sim-"*/python.sh 2>/dev/null | head -1)
+    # if [ -n "$ISAAC_SIM_PATH" ] && [ -f "$ISAAC_SIM_PATH" ]; then
+    #     ISAAC_PYTHON="bash $ISAAC_SIM_PATH"
+    #     echo "Using Isaac Sim python: $ISAAC_PYTHON"
+    # elif command -v isaacsim &> /dev/null; then
+    #     ISAAC_PYTHON="isaacsim"
+    #     echo "Using Isaac Sim python: $ISAAC_PYTHON"
+    # fi
 fi
 
 if [ -z "$ISAAC_PYTHON" ]; then

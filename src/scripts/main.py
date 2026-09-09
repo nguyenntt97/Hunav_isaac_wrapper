@@ -129,8 +129,8 @@ if not source_found:
 LAST_CONFIG_FILE = os.path.join(CONFIG_CONFIG_DIR, "last_launch_config.json")
 
 # built-in presets
-PRESETS = {"warehouse_agents", "hospital_agents", "office_agents"}
-KNOWN_WORLDS = {"warehouse", "hospital", "office", "empty_world"}
+PRESETS = {"warehouse_agents", "hospital_agents", "office_agents", "brownstone_agents"}
+KNOWN_WORLDS = {"warehouse", "hospital", "office", "empty_world", "brownstone"}
 ROBOTS = ["jetbot", "create3", "carter", "carter_ROS"]
 
 # Colors for terminal output
