@@ -2,8 +2,12 @@
 """
 hunav_manager.py
 
-Contains the HuNavManager class for spawning and managing Hunav agents,
-setting up animations (including retargeting), and handling physics.
+Contains the HuNavManager class for spawning and managing HuNavSim agents,
+driving their locomotion, and handling physics.
+
+Locomotion runs on the Isaac Sim 6 behavior framework (see behavior_agent.py).
+HuNavSim's social-force model remains authoritative over where each agent goes;
+Isaac's motion matching only decides how the body renders that motion.
 """
 
 import os
@@ -31,31 +35,45 @@ from isaacsim.core.utils.extensions import enable_extension
 from pxr import Sdf, Gf, UsdGeom, UsdPhysics, PhysxSchema
 import carb
 
-# Import auxiliary animation functions
-from .animation_utils import *
-from .asset_paths import biped_setup_url
+from .animation_utils import find_skelroot_path, find_skeleton_path
+from .behavior_agent import (
+    BehaviorAgentDriver,
+    BehaviorAgentError,
+    STARTUP_EXTENSIONS as BEHAVIOR_EXTENSIONS,
+)
 
 # These are requested at app startup via SimulationApp's extra_args (see
-# ANIM_EXTENSIONS in teleop_hunav_sim.py), which is the only point at which
-# omni.anim.graph.core initialises its CharacterManager. The calls below are
-# no-ops in that path and only matter when HuNavManager is imported into an app
-# that was started some other way.
-enable_extension("omni.anim.retarget.core")
-enable_extension("omni.anim.graph.core")
-
-import omni.anim.graph.core as ag
+# STARTUP_EXTENSIONS in teleop_hunav_sim.py), which is the only point at which
+# the behavior and navigation runtimes initialise. The calls below are no-ops in
+# that path and only matter when HuNavManager is imported into an app that was
+# started some other way.
+for _ext in BEHAVIOR_EXTENSIONS:
+    enable_extension(_ext)
 
 
 class HuNavManager:
     """
-    Manages HunavSim agents by reading configuration from a YAML file,
-    spawning agents as SkelRoot prims, setting up animations (and retargeting),
-    and handling ROS 2 communications.
+    Manages HuNavSim agents by reading configuration from a YAML file,
+    spawning character assets, driving them through the Isaac Sim 6 behavior
+    framework, and handling ROS 2 communications.
     """
 
-    def __init__(self, node, world, config_file_path, robot_prim_path, robot):
+    def __init__(
+        self,
+        node,
+        world,
+        config_file_path,
+        robot_prim_path,
+        robot,
+        terrain_follow=False,
+        step_height=0.25,
+    ):
         self.node = node
         self.stage = world.stage
+        # Physics/render step, matching TeleopHuNavSim's World(). Used to
+        # finite-difference agent velocity, which the behavior API does not
+        # report (get_linear_velocity() returns zero for a walking agent).
+        self.dt = 1.0 / 20.0
         self.robot_prim_path = robot_prim_path
         self.robot_obj = robot
         self.world = world
@@ -109,82 +127,56 @@ class HuNavManager:
             11: 10, # original_female_adult_medical_01
         }
 
-        # Data holders
+        # Data holders. self.agents holds the character prims; the parallel
+        # lists hold the SkelRoot each BehaviorAgentAPI was applied to and the
+        # live agent handle once the timeline is playing.
         self.agents = []
+        self.agent_skelroots = []
+        self.agent_handles = []
         self.agent_initial_states = []
-        self.animationDict = {}
         self._hunav_processes = []
-        self.retarget_flag = False
-        self.bound_animations = {}
-        self.flag_anim = {}
-        
-        # Orientation smoothing
-        self.agent_previous_orientations = {}  # Store previous orientations for smoothing
-        self.orientation_smoothing_factor = 0.15  # Lower = smoother but more lag (0.05-0.3 range)
+
+        # Locomotion. Created in initialize_agents(); handles are acquired
+        # lazily on the first tick, because an agent is not registered with the
+        # behavior system until the simulation has started running.
+        self.driver = None
+        self._agents_active = False
 
         self.robot_prim = None
+        self._last_yaw = {}
+        self._anim_debug_ticks = {}
 
         if config_file_path is not None:
             self.config = self._load_yaml(config_file_path)
         else:
             self.config = None
 
-        # Define the default character source asset (for animation retargeting).
-        # Removed from the Isaac Sim 5.0+ buckets, so this may resolve against
-        # the 4.5 bucket -- see asset_paths.biped_setup_url.
-        self.default_biped_usd = biped_setup_url(self.assets_root)
+        # --- Experimental terrain following -------------------------------
+        # HuNavSim's social-force model is 2-D: getUpdatedAgentMsg never sets a
+        # Z, so every agent is written to the stage at z=0 each tick. On flat
+        # indoor worlds that is correct; on terraced ground (brownstone rises to
+        # 0.94 m) agents walk inside the terrain. When enabled, we raycast down
+        # at each agent's XY and place them on whatever they are standing over,
+        # refusing steps taller than step_height so they route around the tall
+        # tiers rather than teleporting up them.
+        self.terrain_follow = terrain_follow
+        self.step_height = float(step_height)
+        # Last accepted ground Z per agent path, so a missed raycast holds
+        # position instead of snapping the agent to zero.
+        self.agent_ground_z = {}
+        # How far above the agent to start the downward probe, in metres.
+        self.ground_probe_height = 2.0
+        # Per-tick lerp toward the sampled ground, to avoid popping at edges.
+        self.ground_smoothing_factor = 0.2
+        if self.terrain_follow:
+            print(
+                f"[hunav] Terrain following enabled (max step {self.step_height:.2f} m)"
+            )
 
     def _load_yaml(self, relative_path):
         full_path = os.path.join(os.path.dirname(__file__), relative_path)
         with open(full_path, "r") as file:
             return yaml.safe_load(file)
-
-    def slerp_quaternions(self, q1: Gf.Quatf, q2: Gf.Quatf, t: float) -> Gf.Quatf:
-        """
-        Spherical linear interpolation between two quaternions for smooth rotation.
-        
-        Args:
-            q1: Starting quaternion
-            q2: Target quaternion  
-            t: Interpolation factor (0.0 = q1, 1.0 = q2)
-            
-        Returns:
-            Interpolated quaternion
-        """
-        # Ensure we take the shortest path by checking dot product
-        dot = q1.GetReal() * q2.GetReal() + sum(a * b for a, b in zip(q1.GetImaginary(), q2.GetImaginary()))
-        
-        # If dot product is negative, negate one quaternion to take shorter path
-        if dot < 0.0:
-            q2 = Gf.Quatf(-q2.GetReal(), -q2.GetImaginary()[0], -q2.GetImaginary()[1], -q2.GetImaginary()[2])
-            dot = -dot
-        
-        # If quaternions are very close, use linear interpolation to avoid division by zero
-        if dot > 0.9995:
-            result_real = q1.GetReal() + t * (q2.GetReal() - q1.GetReal())
-            result_imag = [
-                q1.GetImaginary()[i] + t * (q2.GetImaginary()[i] - q1.GetImaginary()[i])
-                for i in range(3)
-            ]
-            result = Gf.Quatf(result_real, result_imag[0], result_imag[1], result_imag[2])
-            return result.GetNormalized()
-        
-        # Calculate spherical interpolation
-        theta_0 = math.acos(abs(dot))
-        sin_theta_0 = math.sin(theta_0)
-        theta = theta_0 * t
-        sin_theta = math.sin(theta)
-        
-        s0 = math.cos(theta) - dot * sin_theta / sin_theta_0
-        s1 = sin_theta / sin_theta_0
-        
-        result_real = s0 * q1.GetReal() + s1 * q2.GetReal()
-        result_imag = [
-            s0 * q1.GetImaginary()[i] + s1 * q2.GetImaginary()[i]
-            for i in range(3)
-        ]
-        
-        return Gf.Quatf(result_real, result_imag[0], result_imag[1], result_imag[2]).GetNormalized()
 
     def normalize_angle(self, a: float) -> float:
         value = a
@@ -264,10 +256,17 @@ class HuNavManager:
 
     def initialize_agents(self):
         """
-        Reads the YAML configuration for agents, spawns them, and sets up their animations
-        using a two-level hierarchy. For each agent, the outer container prim (type "Xform") is updated by
-        compute_agents (global transform), while the inner child prim (type "SkelRoot") is
-        animated via an AnimationGraph created beforehand.
+        Read the agent configuration, spawn one character per agent, and make
+        each of them a behavior agent.
+
+        Character transforms are owned by the behavior system once the agents
+        are live, so each character is payloaded directly at its initial pose
+        with no moving parent: a parent transform would compose with the
+        engine's own and carry the agent off the map.
+
+        The live agent handles are NOT acquired here. An agent is only
+        registered once the simulation is running, so acquisition happens
+        lazily on the first tick -- see _ensure_agents_active().
         """
         if self.config is None:
             print("[HuNavManager] No config loaded, skipping agent creation.")
@@ -275,70 +274,36 @@ class HuNavManager:
 
         agent_configs = self.config["hunav_loader"]["ros__parameters"]["agents"]
 
-        # Create animations using the auxiliary module functions
-        animations_path = os.path.join(
-            self.assets_root, "Isaac", "People", "Animations"
+        self.driver = BehaviorAgentDriver(
+            self.stage, self.assets_root, dt=self.dt
         )
-        walk_anim = create_animation(
-            self.stage,
-            "/World/Animations/WalkLoop",
-            os.path.join(animations_path, "stand_walk_loop_in_place.skelanim.usd"),
-        )
-        idle_anim = create_animation(
-            self.stage,
-            "/World/Animations/IdleLoop",
-            os.path.join(animations_path, "stand_idle_loop.skelanim.usd"),
-        )
-        self.source_animation_dict = {0: idle_anim.GetPath(), 1: walk_anim.GetPath()}
-        self.target_animation_parent_path = "/World/Characters"
-        self.retarget_anims_path = [
-            os.path.join(self.target_animation_parent_path, "IdleLoop"),
-            os.path.join(self.target_animation_parent_path, "WalkLoop"),
-        ]
-        self.animationDict = {
-            0: self.retarget_anims_path[0],
-            1: self.retarget_anims_path[1],
-        }
 
-        # Set up a rotation for upright orientation
-        rotX = Gf.Rotation(Gf.Vec3d(1, 0, 0), 90).GetQuat()
-        rotXQ = Gf.Quatf(rotX)
+        # Bake the navmesh FIRST, while the stage still holds only the world.
+        # The baker's memory use scales with resident geometry, and it fails by
+        # returning an empty navmesh rather than raising -- so the motion
+        # library payload and eight character assets are loaded afterwards.
+        self.driver.configure_navmesh()
+        bounds = self._agent_activity_bounds() or self._world_bounds()
+        self.driver.ensure_navmesh_volume(bounds=bounds)
+        # Ground level the agents stand at: the volume's own floor is padded
+        # well below it and is not a usable reference for what is walkable.
+        ground_z = (bounds[0][2] + self._NAVMESH_Z_BELOW) if bounds else 0.0
+        self.driver.bake_navmesh(
+            extent=self.driver.navmesh_extent, ground_z=ground_z
+        )
 
-        # Spawn the default biped for skeletal binding
-        init_pos_src = Gf.Vec3d(0, 0, 0)
-        init_rot_src = Gf.Quatf(1, 0, 0, 0) * rotXQ
-        source_prim_path = "/World/Biped_Setup"
-        source_agent_prim = self.stage.DefinePrim(source_prim_path, "SkelRoot")
-        source_agent_prim.GetReferences().AddReference(self.default_biped_usd)
-        xform_src = UsdGeom.Xformable(source_agent_prim)
-        found_translate = False
-        for op in xform_src.GetOrderedXformOps():
-            if op.GetOpName() == "xformOp:translate":
-                op.Set(init_pos_src)
-                found_translate = True
-                break
-        if not found_translate:
-            xform_src.AddTranslateOp().Set(init_pos_src)
-        xform_src.AddOrientOp().Set(init_rot_src)
-        source_agent_prim.GetAttribute("visibility").Set("invisible")
-        source_agent_prim.CreateAttribute(
-            "physxRigidBody:disableGravity", Sdf.ValueTypeNames.Bool
-        ).Set(True)
-        source_agent_prim.CreateAttribute(
-            "physxContact:collisionEnabled", Sdf.ValueTypeNames.Bool
-        ).Set(False)
+        self.driver.load_motion_library()
 
         asset_cycle = self.target_model_paths.copy()
         random.shuffle(asset_cycle)
 
-        # For each agent defined in the agents_x.yaml:
         for agent_name in agent_configs:
             agent_cfg = self.config["hunav_loader"]["ros__parameters"][agent_name]
 
             # Use skin value to select specific character model
             skin_value = agent_cfg["skin"]
             asset_path = self.get_character_model_from_skin(skin_value)
-            
+
             if asset_path is None:
                 # Invalid skin value, fall back to round-robin selection
                 self.node.get_logger().warn(
@@ -358,74 +323,31 @@ class HuNavManager:
                     self.node.get_logger().info(
                         f"Agent {agent_name} using skin {skin_value}: {asset_path.split('/')[-2]}"
                     )
-            
+
             init_pose = agent_cfg["init_pose"]
-            # translation
-            global_pos = Gf.Vec3d(init_pose["x"], init_pose["y"], init_pose["z"])
+            position = (init_pose["x"], init_pose["y"], init_pose["z"])
+            yaw = float(init_pose.get("h", 0.0))
 
-            h_rad = init_pose.get("h", 0.0)
-            h_deg = h_rad * 180.0 / math.pi
-
-            # X-tilt rotation (90°)
-            rotX = Gf.Rotation(Gf.Vec3d(1, 0, 0), 90.0)
-            qdX = rotX.GetQuat()  # this is a Gf.Quatd
-            # convert to single‐precision quaternion:
-            rotXQ = Gf.Quatf(qdX.GetReal(), Gf.Vec3f(qdX.GetImaginary()))
-
-            # Z-heading rotation
-            rotZ = Gf.Rotation(Gf.Vec3d(0, 0, 1), h_deg)
-            qdZ = rotZ.GetQuat()
-            rotZQ = Gf.Quatf(qdZ.GetReal(), Gf.Vec3f(qdZ.GetImaginary()))
-
-            # combine: yaw then tilt
-            global_rot = rotZQ * rotXQ
-
-            # now apply to container:
-            container_path = f"/World/Characters/{agent_name}"
-            container = self.stage.DefinePrim(container_path, "Xform")
-            xf = UsdGeom.Xformable(container)
-            xf.AddTranslateOp().Set(global_pos)
-            xf.AddOrientOp().Set(global_rot)
-            
-            PhysxSchema.PhysxRigidBodyAPI.Apply(container)
-            UsdPhysics.RigidBodyAPI.Apply(container)
-
-            # Create the inner animated SkelRoot as a child of the container
-            anim_path = container_path + "/Animation"
-            agent_skelroot = self.stage.DefinePrim(anim_path, "SkelRoot")
-            agent_skelroot.GetReferences().AddReference(asset_path)
-
-            # Apply retargeting and create the AnimationGraph on the inner SkelRoot
-            if not self.retarget_flag:
-                setup_anim_retargeting(
-                    self.stage,
-                    agent_skelroot,
-                    self.source_animation_dict,
-                    self.target_animation_parent_path,
-                )
-                self._verify_retargeted_animations()
-                self.retarget_flag = True
-
-            # Create and apply AnimationGraph
-            anim_graph_path = create_agent_animation_graph(
-                self.stage,
-                agent_skelroot,
-                idle_anim_path=self.animationDict.get(0),
-                walk_anim_path=self.animationDict.get(1),
+            character = self.driver.spawn_character(
+                f"/World/Characters/{agent_name}", asset_path, position, yaw
             )
-            apply_animation_graph(
-                self.stage.GetPrimAtPath(find_skelroot_path(agent_skelroot)),
-                anim_graph_path,
-            )
-            self.bound_animations[agent_skelroot.GetPath()] = anim_graph_path
+            self.agents.append(character)
+            self.agent_initial_states.append({"position": position, "yaw": yaw})
+            self.agent_handles.append(None)
 
-            self.flag_anim[agent_skelroot.GetPath()] = False
+        # Let every payload resolve before anything inspects the hierarchies.
+        # attach() needs the SkelRoot, which does not exist until the character
+        # asset has finished loading.
+        self._pump_app(400)
 
-            # Add the container (global transform) to the agents list
-            self.agents.append(container)
-            self.agent_initial_states.append(
-                {"position": global_pos, "orientation": global_rot}
+        for character in self.agents:
+            self.agent_skelroots.append(
+                self.driver.attach(character, find_skelroot_path)
             )
+
+        print(
+            f"[HuNavManager] {len(self.agents)} agents spawned as behavior agents"
+        )
 
         # Set up the robot prim
         if self.robot_prim_path:
@@ -439,33 +361,196 @@ class HuNavManager:
         else:
             print("[HuNavManager] no robot_prim_path provided")
 
-    def _verify_retargeted_animations(self):
-        """
-        Confirm retargeting actually produced the clips the AnimationGraphs bind to.
+    @staticmethod
+    def _pump_app(iterations):
+        """Advance the app so pending asset loads complete."""
+        import omni.kit.app
 
-        setup_anim_retargeting() returns quietly when the source biped is missing
-        (e.g. Biped_Setup.usd absent from the asset bucket), which would otherwise
-        leave every agent gliding to its goal with no walk cycle and no error.
+        app = omni.kit.app.get_app()
+        for _ in range(iterations):
+            app.update()
+
+    # Margin around the agents' working area for the navmesh volume, in metres.
+    _NAVMESH_MARGIN = 6.0
+    # Vertical band the navmesh covers, relative to the agents' ground level.
+    _NAVMESH_Z_BELOW = 2.0
+    _NAVMESH_Z_ABOVE = 4.0
+
+    def _agent_activity_bounds(self):
+        """Extent of everywhere the agents actually go, padded.
+
+        Sizing the navmesh volume to the whole world is what made brownstone
+        unbakeable: its bounds span 84 x 128 x 23 m, and the vertical extent is
+        almost entirely the sunken road at -19.8 m and empty air. The GPU baker
+        exhausts CUDA memory long before that voxelises, and coarsening the
+        sampling far enough to fit leaves cells larger than agentMinIslandRadius,
+        at which point nothing survives the bake at all.
+
+        The agents only ever occupy their start poses and their goals, so that
+        -- plus a margin -- is the region that actually needs to be walkable.
         """
-        missing = [
-            path
-            for path in self.retarget_anims_path
-            if not self.stage.GetPrimAtPath(path).IsValid()
-        ]
-        if missing:
-            raise RuntimeError(
-                "Animation retargeting produced no clips at "
-                f"{missing}. The source biped ({self.default_biped_usd}) failed to "
-                "load or has no skeleton -- agents would not animate. Check that "
-                "the URL is reachable and that omni.anim.retarget.core is enabled."
+        if self.config is None:
+            return None
+        params = self.config["hunav_loader"]["ros__parameters"]
+        points = []
+
+        for name in params.get("agents", []):
+            pose = params.get(name, {}).get("init_pose")
+            if pose:
+                points.append((float(pose["x"]), float(pose["y"]),
+                               float(pose.get("z", 0.0))))
+
+        goals = params.get("global_goals") or {}
+        for goal in goals.values():
+            try:
+                points.append((float(goal["x"]), float(goal["y"]), 0.0))
+            except (KeyError, TypeError, ValueError):
+                continue
+
+        if not points:
+            return None
+
+        margin = self._NAVMESH_MARGIN
+        xs = [pt[0] for pt in points]
+        ys = [pt[1] for pt in points]
+        ground = min(pt[2] for pt in points)
+        return (
+            (min(xs) - margin, min(ys) - margin, ground - self._NAVMESH_Z_BELOW),
+            (max(xs) + margin, max(ys) + margin, ground + self._NAVMESH_Z_ABOVE),
+        )
+
+    def _world_bounds(self):
+        """XY/Z extent of /World. Fallback when the scenario defines no goals."""
+        from pxr import Usd
+
+        cache = UsdGeom.BBoxCache(
+            Usd.TimeCode.Default(), [UsdGeom.Tokens.default_]
+        )
+        root = self.stage.GetPrimAtPath("/World")
+        if not root or not root.IsValid():
+            return None
+        rng = cache.ComputeWorldBound(root).ComputeAlignedRange()
+        if rng.IsEmpty():
+            return None
+        return tuple(rng.GetMin()), tuple(rng.GetMax())
+
+    def _ensure_agents_active(self):
+        """Acquire the live agent handles. Returns True once all are live.
+
+        An agent is not registered with the behavior system until the
+        simulation has started running, so this is retried each tick until it
+        succeeds rather than being done at spawn time.
+        """
+        if self._agents_active or self.driver is None:
+            return self._agents_active
+
+        import omni.anim.behavior.core as bh
+
+        interface = bh.acquire_interface()
+        pending = 0
+        for index, skelroot in enumerate(self.agent_skelroots):
+            if self.agent_handles[index] is not None:
+                continue
+            if interface.get_agent(skelroot) is None:
+                pending += 1
+                continue
+            agent_cfg = self._agent_cfg(index)
+            handle = self.driver.acquire(skelroot)
+            handle.agent.set_speed(float(agent_cfg["max_vel"]))
+            state = self.agent_initial_states[index]
+            self.driver.teleport(handle, state["position"], state["yaw"])
+            self.agent_handles[index] = handle
+
+        self._tick_attempts = getattr(self, "_tick_attempts", 0) + 1
+        if pending == 0:
+            self._agents_active = True
+            print(f"[HuNavManager] {len(self.agent_handles)} behavior agents live")
+        elif self._tick_attempts == 200:
+            raise BehaviorAgentError(
+                f"{pending} of {len(self.agent_skelroots)} agents were never "
+                "registered with the behavior system after 200 ticks. The usual "
+                "cause is a missing navmesh: it bakes only from UsdGeom.Mesh "
+                "geometry, so a world whose walkable ground is implicit "
+                "(Cube/Plane) produces none and no agent is ever created."
             )
+        return self._agents_active
+
+    def _agent_cfg(self, index):
+        agent_ref = self.config["hunav_loader"]["ros__parameters"]["agents"][index]
+        return self.config["hunav_loader"]["ros__parameters"][agent_ref]
+
+    def verify_locomotion(self, min_driven_ticks=100):
+        """Report agents whose body is not actually being animated.
+
+        The failure this guards against was silent: the old retargeting step
+        produced a clip whose joints rotated by a mean of 0.08 degrees across
+        the whole walk cycle, every structural check passed, and the only
+        symptom was agents gliding to their goals in bind pose. Checking that
+        prims and clips are *valid* does not catch that, so this checks that a
+        leg joint has actually changed pose while the agent was being driven.
+
+        Returns a list of human-readable problems; empty means healthy.
+        """
+        problems = []
+        for index, handle in enumerate(self.agent_handles):
+            label = f"agent {index + 1}"
+            if handle is None:
+                problems.append(f"{label}: no live behavior agent")
+                continue
+            try:
+                height = float(handle.agent.get_height())
+            except Exception as exc:
+                problems.append(f"{label}: agent handle is dead ({exc})")
+                continue
+            # A rig the motion library cannot pose reports a degenerate height
+            # rather than a plausible human one.
+            if not 0.5 < height < 2.5:
+                problems.append(
+                    f"{label}: implausible body height {height:.2f} m -- the "
+                    "motion library is probably not posing this rig"
+                )
+            if handle.driven_ticks < min_driven_ticks:
+                # Not enough evidence yet; say so rather than pass silently.
+                problems.append(
+                    f"{label}: only driven for {handle.driven_ticks} ticks, "
+                    f"need {min_driven_ticks} before the skinning check means "
+                    "anything"
+                )
+            elif not handle._joint_moved:
+                problems.append(
+                    f"{label}: driven for {handle.driven_ticks} ticks but its "
+                    "leg joint never moved -- the character is being slid along "
+                    "the ground, not animated (this is the bind-pose failure "
+                    "the AnimationGraph path used to produce)"
+                )
+        return problems
+
+    def report_locomotion_health(self, min_driven_ticks=100):
+        """Print the result of verify_locomotion once. Returns True if healthy."""
+        problems = self.verify_locomotion(min_driven_ticks)
+        if problems:
+            print("[HuNavManager] locomotion check FAILED:")
+            for problem in problems:
+                print(f"  - {problem}")
+            return False
+        print(
+            f"[HuNavManager] locomotion check passed: {len(self.agent_handles)} "
+            "agents animating"
+        )
+        return True
 
     def reset_agent_states(self):
-        for agent, init_state in zip(self.agents, self.agent_initial_states):
-            agent.GetAttribute("xformOp:translate").Set(init_state["position"])
-            agent.GetAttribute("xformOp:orient").Set(init_state["orientation"])
-        
-        self.agent_previous_orientations.clear()
+        """Return every agent to its configured start pose.
+
+        Teleporting is right here and wrong for driving: it places the agent
+        exactly, but a stream of teleports reads to the motion matcher as
+        discontinuous jumps and never produces a gait.
+        """
+        if self.driver is None:
+            return
+        for handle, state in zip(self.agent_handles, self.agent_initial_states):
+            if handle is not None:
+                self.driver.teleport(handle, state["position"], state["yaw"])
         print("[HuNavManager] agent states reset.")
 
     def clear_simulation(self):
@@ -475,10 +560,12 @@ class HuNavManager:
         for prim in world_prim.GetChildren():
             stage.RemovePrim(prim.GetPath())
         self.agents.clear()
+        self.agent_skelroots.clear()
+        self.agent_handles.clear()
         self.robot = None
         self.agent_initial_states.clear()
-        self.animationDict.clear()
-        self.agent_previous_orientations.clear()  # Clean up orientation tracking
+        self.driver = None
+        self._agents_active = False
 
     # Obstacle detection functions
     def generate_lasers(self, num_lasers: int) -> List[Gf.Vec3f]:
@@ -540,6 +627,71 @@ class HuNavManager:
 
         return closest_hits
 
+    def sample_ground_height(self, x, y, previous_z):
+        """
+        Height of the ground under (x, y), or None if nothing was found.
+
+        Reuses the same scene-query interface as get_closest_obstacles, only
+        pointing down instead of sideways. Two things to be careful of:
+
+        - PhysX returns no hits until after World.reset(), so the first ticks
+          legitimately miss. Callers must hold the previous Z rather than
+          falling back to zero.
+        - The agent containers carry RigidBodyAPI, so a ray starting inside an
+          agent can hit that agent. We start well above and skip any hit that
+          lands on a character.
+        """
+        scene_query = omni.physx.get_physx_scene_query_interface()
+        origin_z = float(previous_z) + self.ground_probe_height
+        origin = Gf.Vec3f(float(x), float(y), origin_z)
+        direction = Gf.Vec3f(0.0, 0.0, -1.0)
+        max_distance = self.ground_probe_height + 20.0
+
+        hit = scene_query.raycast_closest(origin, direction, max_distance)
+        if not hit.get("hit", False):
+            return None
+
+        body = str(hit.get("rigidBody", "") or hit.get("collision", ""))
+        if "/World/Characters" in body:
+            # Started inside another agent -- retry from just below that hit.
+            hit_z = hit.get("position")[2]
+            retry_origin = Gf.Vec3f(float(x), float(y), float(hit_z) - 0.05)
+            hit = scene_query.raycast_closest(retry_origin, direction, max_distance)
+            if not hit.get("hit", False):
+                return None
+            body = str(hit.get("rigidBody", "") or hit.get("collision", ""))
+            if "/World/Characters" in body:
+                return None
+
+        return float(hit.get("position")[2])
+
+    def resolve_agent_z(self, agent_path, x, y, fallback_z):
+        """
+        Ground-following Z for an agent, honouring the step-height limit.
+
+        Stepping down is always allowed (agents walk off kerbs); stepping up is
+        refused beyond self.step_height, so the agent does not pop up the face
+        of a tall terrace.
+
+        Note this only clamps the vertical: HuNavSim owns XY and knows nothing
+        about the terrain, so refusing a step does not steer the agent away.
+        Horizontal avoidance comes from get_closest_obstacles(), whose rays at
+        0.05-1.0 m above the agent already hit terrace faces because those are
+        colliders, and are fed to HuNavSim as obstacle forces.
+        """
+        previous_z = self.agent_ground_z.get(agent_path, fallback_z)
+        ground_z = self.sample_ground_height(x, y, previous_z)
+        if ground_z is None:
+            return previous_z
+
+        if ground_z - previous_z > self.step_height:
+            # Too tall to climb: stay at the current height.
+            return previous_z
+
+        smoothed = previous_z + (ground_z - previous_z) * self.ground_smoothing_factor
+        self.agent_ground_z[agent_path] = smoothed
+        return smoothed
+
     def euler_from_quaternion(
         self, x: float, y: float, z: float, w: float
     ) -> Tuple[float, float, float]:
@@ -563,6 +715,12 @@ class HuNavManager:
         """
         if self.robot_prim is None:
             print("[HuNavManager] No robot assigned.")
+            return
+
+        # Agents are only registered with the behavior system once the
+        # simulation is running, so the handles are acquired on the first ticks
+        # rather than at spawn time.
+        if not self._ensure_agents_active():
             return
 
         # Build Agents message
@@ -652,36 +810,37 @@ class HuNavManager:
         agent.radius = float(agent_cfg["radius"])
         agent.desired_velocity = float(agent_cfg["max_vel"])
 
-        # Read transforms
-        pos = agent_prim.GetAttribute("xformOp:translate").Get()
-        rot = agent_prim.GetAttribute("xformOp:orient").Get()
-        rw = rot.GetReal()
-        rx, ry, rz = rot.GetImaginary()
+        # Read the pose back from the behavior agent, not from the prim: the
+        # engine writes agent transforms to Fabric, so xformOp:translate on the
+        # character keeps its authored spawn value while the agent walks.
+        handle = self.agent_handles[index]
+        pos, _quat, lin = self.driver.pose(handle)
+        yaw = self.driver.yaw(handle)
 
-        # Position
         agent.position.position.x = float(pos[0])
         agent.position.position.y = float(pos[1])
         agent.position.position.z = float(pos[2])
-        agent.position.orientation.x = float(rx)
-        agent.position.orientation.y = float(ry)
-        agent.position.orientation.z = float(rz)
-        agent.position.orientation.w = float(rw)
-        _, _, yaw = self.euler_from_quaternion(
-            float(rx), float(ry), float(rz), float(rw)
-        )
-        agent.yaw = float(self.normalize_angle(yaw - math.pi / 2.0))
+        # Orientation is rebuilt from the agent's own facing direction rather
+        # than passed through from get_world_rotation(), which also carries the
+        # rig's internal axis corrections (this character's forward is -Y).
+        agent.position.orientation.x = 0.0
+        agent.position.orientation.y = 0.0
+        agent.position.orientation.z = float(math.sin(yaw * 0.5))
+        agent.position.orientation.w = float(math.cos(yaw * 0.5))
+        agent.yaw = float(self.normalize_angle(yaw))
 
-        # Velocities
-        lin = agent_prim.GetAttribute("physics:velocity").Get()
-        ang = agent_prim.GetAttribute("physics:angularVelocity").Get()
-        agent.linear_vel = float(np.linalg.norm(lin))
-        agent.angular_vel = float(np.linalg.norm(ang))
+        # Velocity is finite-differenced in the driver; the behavior API's
+        # get_linear_velocity() reports zero even for a walking agent.
+        ang_z = self.normalize_angle(yaw - self._last_yaw.get(index, yaw)) / self.dt
+        self._last_yaw[index] = yaw
+        agent.linear_vel = float(math.hypot(lin[0], lin[1]))
+        agent.angular_vel = float(abs(ang_z))
         agent.velocity.linear.x = float(lin[0])
         agent.velocity.linear.y = float(lin[1])
         agent.velocity.linear.z = float(lin[2])
-        agent.velocity.angular.x = float(ang[0])
-        agent.velocity.angular.y = float(ang[1])
-        agent.velocity.angular.z = float(ang[2])
+        agent.velocity.angular.x = 0.0
+        agent.velocity.angular.y = 0.0
+        agent.velocity.angular.z = float(ang_z)
 
         # Goals
         agent.cyclic_goals = agent_cfg["cyclic_goals"]
@@ -786,118 +945,73 @@ class HuNavManager:
             return None
 
     def _update_agents(self, updated_agents):
+        """Hand one tick of HuNavSim's output to the motion matcher.
+
+        HuNavSim's social-force model decides where each agent should be; the
+        behavior system decides how the body gets there. The agent is given a
+        goal a short way along its social-force velocity rather than its exact
+        commanded position -- asking it to move to where it already stands
+        produces no gait. Tracking error in the spike was a mean of 0.17 m.
+
+        Nothing is written to the character prims here. The engine owns their
+        transforms, and writing a competing transform is what used to carry
+        agents off the map.
+        """
+        debug = _os.environ.get("HUNAV_ANIM_DEBUG", "0") != "0"
+
         for upd in updated_agents.agents:
             idx = upd.id - 1
-            agent_prim = self.agents[idx]
-            agent_skelroot_prim = self.stage.GetPrimAtPath(
-                agent_prim.GetPath().AppendChild("Animation")
-            )
+            if idx < 0 or idx >= len(self.agent_handles):
+                continue
+            handle = self.agent_handles[idx]
+            if handle is None:
+                continue
 
-            anim_graph_path = self.bound_animations.get(agent_skelroot_prim.GetPath())
-
-            if not self.flag_anim[agent_skelroot_prim.GetPath()]:
-                self.stage.GetPrimAtPath(
-                    find_skelroot_path(agent_skelroot_prim)
-                ).SetMetadata("kind", "component")
-                self.flag_anim[agent_skelroot_prim.GetPath()] = True
-
-            char = ag.get_character(str(find_skelroot_path(agent_skelroot_prim)))
-
-            # Set position
-            new_pos = Gf.Vec3d(
+            position = (
                 upd.position.position.x,
                 upd.position.position.y,
                 upd.position.position.z,
             )
-            agent_prim.GetAttribute("xformOp:translate").Set(new_pos)
-
-            # Set orientation with smoothing
-            new_quat = Gf.Quatf(
-                upd.position.orientation.w,
-                upd.position.orientation.x,
-                upd.position.orientation.y,
-                upd.position.orientation.z,
-            )
-            
-            # Pre-calculate orientation corrections
-            rotX = Gf.Rotation(Gf.Vec3d(0, 0, 1), 90).GetQuat()
-            rotXQ = Gf.Quatf(rotX)
-            rotZ = Gf.Rotation(Gf.Vec3d(1, 0, 0), 90).GetQuat()
-            rotZQ = Gf.Quatf(rotZ)
-            
-            # Apply corrections to get the target final orientations
-            target_prim_quat = new_quat * rotXQ * rotZQ  # Final orientation for prim
-            rotZQ_anim = Gf.Quatf(Gf.Rotation(Gf.Vec3d(1, 0, 0), 0).GetQuat())
-            target_anim_quat = new_quat * rotXQ * rotZQ_anim  # Final orientation for animation
-            
-            # Get current orientations for smoothing
-            agent_path = agent_prim.GetPath()
-            
-            # Apply orientation smoothing to the corrected orientations
-            if agent_path in self.agent_previous_orientations:
-                # Get previous animation quaternion (stored separately)
-                prev_prim_quat, prev_anim_quat = self.agent_previous_orientations[agent_path]
-                
-                # Interpolate both prim and animation orientations for smooth turning
-                smoothed_prim_quat = self.slerp_quaternions(
-                    prev_prim_quat, 
-                    target_prim_quat, 
-                    self.orientation_smoothing_factor
+            if self.terrain_follow:
+                # HuNavSim's model is 2-D and never reports a Z. The navmesh
+                # already keeps agents on the walkable surface, so this only
+                # matters for the goal's height on terraced ground.
+                position = (
+                    position[0],
+                    position[1],
+                    self.resolve_agent_z(
+                        self.agents[idx].GetPath(),
+                        position[0],
+                        position[1],
+                        position[2],
+                    ),
                 )
-                smoothed_anim_quat = self.slerp_quaternions(
-                    prev_anim_quat,
-                    target_anim_quat,
-                    self.orientation_smoothing_factor
-                )
-            else:
-                # First frame - use target orientations directly
-                smoothed_prim_quat = target_prim_quat
-                smoothed_anim_quat = target_anim_quat
-            
-            # Store current orientations for next frame (both prim and animation)
-            self.agent_previous_orientations[agent_path] = (smoothed_prim_quat, smoothed_anim_quat)
-            
-            # Apply the smoothed orientations
-            agent_prim.GetAttribute("xformOp:orient").Set(smoothed_prim_quat)
 
-            lin = Gf.Vec3d(
+            velocity = (
                 upd.velocity.linear.x,
                 upd.velocity.linear.y,
                 upd.velocity.linear.z,
             )
+            self.driver.drive(handle, position, velocity)
 
-            # Animation orientation correction (use smoothed animation orientation).
-            # HUNAV_DRIVE_CHARACTER=0 disables this: the character prim is a child
-            # of the container Xform that was just placed at new_pos, so once the
-            # AnimationGraph actually compiles and the character is live, setting
-            # its world transform here composes with the parent and the agent
-            # accelerates away from the map.
-            if char and _os.environ.get("HUNAV_DRIVE_CHARACTER", "1") != "0":
-                pos_carb = carb.Float3(new_pos[0], new_pos[1], new_pos[2])
-                real = smoothed_anim_quat.GetReal()
-                imag = smoothed_anim_quat.GetImaginary()
-                rot_carb = carb.Float4(imag[0], imag[1], imag[2], real)
-                char.set_world_transform(pos_carb, rot_carb)
-
-            # Set velocities
-            agent_prim.GetAttribute("physics:velocity").Set(lin)
-            ang = Gf.Vec3d(
-                upd.velocity.angular.x,
-                upd.velocity.angular.y,
-                upd.velocity.angular.z,
-            )
-            agent_prim.GetAttribute("physics:angularVelocity").Set(ang)
-
-            # Set animation based on agent's speed
-            speed = np.linalg.norm(lin)
-            max_expected_speed = 1.5
-            normalized_speed = np.clip(speed / max_expected_speed, 0.0, 1.0)
-            if anim_graph_path:
-                set_anim_graph_speed(
-                    self.stage, char, anim_graph_path, normalized_speed
-                )
-            else:
-                print(f"No AnimationGraph bound for {agent_prim.GetPath()}")
+            if debug:
+                key = self.agent_skelroots[idx]
+                n = self._anim_debug_ticks.get(key, 0)
+                if n == 0 or n % 100 == 0:
+                    speed = math.hypot(velocity[0], velocity[1])
+                    actual = handle.agent.get_world_translation()
+                    drift = math.hypot(
+                        float(actual[0]) - position[0],
+                        float(actual[1]) - position[1],
+                    )
+                    print(
+                        f"[anim] {key} |v|={speed:.3f} "
+                        f"cmd=({position[0]:.2f},{position[1]:.2f}) "
+                        f"actual=({float(actual[0]):.2f},{float(actual[1]):.2f}) "
+                        f"drift={drift:.3f}m",
+                        flush=True,
+                    )
+                self._anim_debug_ticks[key] = n + 1
 
     def get_character_model_from_skin(self, skin_value):
         """

@@ -1,0 +1,3 @@
+[submodule "third_party/ov_navmesh"]
+	path = third_party/ov_navmesh
+	url = https://github.com/cadop/ov_navmesh

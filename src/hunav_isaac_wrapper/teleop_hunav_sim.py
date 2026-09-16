@@ -30,21 +30,29 @@ LIVESTREAM = _env_flag("LIVESTREAM") or _os.environ.get(
 # the installed .kit file never has to be patched.
 #
 # They must be enabled during app startup rather than afterwards:
-# omni.anim.graph.core only initialises its CharacterManager while the app is
+# the behavior and navigation runtimes only initialise while the app is
 # booting, and OmniGraph node types (isaacsim.ros2.bridge.*,
 # isaacsim.sensors.physics.*) must be registered before any stage referencing
 # them is opened.
 #
-#   omni.anim.graph.core     - AnimationGraph runtime + ag.get_character()
-#   omni.anim.retarget.core  - CreateRetargetAnimationsCommand
+#   omni.anim.behavior.*     - motion matching: IBehaviorAgent, BehaviorAgentAPI
+#   omni.anim.navigation.*   - navmesh baking; agents are not created without one
+#   omni.anim.asset          - asset runtime the behavior system builds on
 #   isaacsim.ros2.bridge     - ROS2Context/PublishClock/SubscribeTwist OmniGraph
 #                              nodes, used by create_ros_clock_action_graph() and
 #                              by the carter_ROS robot's built-in graph
 #   isaacsim.sensors.physics - IsaacReadIMU, referenced by the carter_ROS USD
 #   omni.physx.bundle        - full PhysX suite (scene query, vehicle, etc.)
+#
+# omni.anim.graph.core and omni.anim.retarget.core used to be here for the
+# AnimationGraph path. That path is gone: see behavior_agent.py.
 STARTUP_EXTENSIONS = [
-    "omni.anim.graph.core",
-    "omni.anim.retarget.core",
+    "omni.anim.behavior.bundle",
+    "omni.anim.behavior.core",
+    "omni.anim.behavior.schema",
+    "omni.anim.navigation.bundle",
+    "omni.anim.navigation.core",
+    "omni.anim.asset",
     "isaacsim.ros2.bridge",
     "isaacsim.sensors.physics",
     "omni.physx.bundle",
@@ -105,6 +113,7 @@ if LIVESTREAM:
         flush=True,
     )
 
+import math
 import os
 import signal
 import subprocess
@@ -123,11 +132,18 @@ import omni.graph.core as og
 # Import the WorldBuilder and HuNavManager modules.
 from .world_builder import WorldBuilder
 from .hunav_manager import HuNavManager
+from .terrain import apply_flat_ground
 from .asset_paths import (
     get_isaac_major,
     is_robot_available,
     robot_usd_relative_path,
 )
+
+# Default maximum step an agent can climb when --terrain-follow is on, in metres.
+# 0.25 m is about a kerb: on the brownstone terraces (mean 0.43 m, max 0.94 m)
+# agents take the shallow tiers and route around the tall ones.
+DEFAULT_STEP_HEIGHT = 0.25
+
 
 # Where the robot is spawned, per world. The origin works for the indoor worlds,
 # but brownstone has several coincident ground meshes stacked at z=0 around
@@ -228,7 +244,15 @@ class TeleopHuNavSim(Node):
     - Agent management and update (via HuNavManager)
     """
 
-    def __init__(self, map_name, hunav_config, robot_name):
+    def __init__(
+        self,
+        map_name,
+        hunav_config,
+        robot_name,
+        flat_ground=False,
+        terrain_follow=False,
+        step_height=DEFAULT_STEP_HEIGHT,
+    ):
         super().__init__("hunav_sim")
         self._shutdown_requested = False
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -250,10 +274,31 @@ class TeleopHuNavSim(Node):
                 "Could not resolve the Isaac Sim assets root (Nucleus root not found)."
             )
 
+        # Experimental terrain flags. Either the CLI flag or the env var turns
+        # these on, so they can be toggled without going through the launcher.
+        self.flat_ground = flat_ground or _env_flag("HUNAV_FLAT_GROUND")
+        self.terrain_follow = terrain_follow or _env_flag("HUNAV_TERRAIN_FOLLOW")
+        self.step_height = float(
+            _os.environ.get("HUNAV_STEP_HEIGHT", step_height)
+        )
+        if self.flat_ground and self.terrain_follow:
+            # Flattening the world leaves nothing to follow.
+            print(
+                "[hunav] --flat-ground and --terrain-follow are both set; "
+                "flat ground wins and terrain following is disabled."
+            )
+            self.terrain_follow = False
+
         # Load USD stage
         self.builder = WorldBuilder(base_path=find_package_share_directory())
+        map_loaded = False
         if map_name:
-            self.builder.load_map(map_name)
+            map_loaded = self.builder.load_map(map_name)
+
+        # Flatten the terrain before the physics scene exists, so the colliders
+        # PhysX cooks are the ones we actually want.
+        if self.flat_ground and map_loaded:
+            apply_flat_ground(self.builder.get_stage(), map_name)
 
         # Create World object
         timestep = 1.0 / 20.0
@@ -320,6 +365,15 @@ class TeleopHuNavSim(Node):
 
         # Add robot to world
         robot_prim_path = f"/World/{robot_config['name']}"
+        self.robot_spawn_pose = ROBOT_SPAWN_POSE.get(map_name, DEFAULT_ROBOT_SPAWN)
+        # Logged because a robot that is "missing" is nearly always one that was
+        # spawned somewhere else (a stale session using an older spawn table) or
+        # one that PhysX ejected on the first step -- see _warn_if_robot_moved.
+        print(
+            f"[hunav] Robot '{robot_config['name']}' spawning at "
+            f"{self.robot_spawn_pose} (world key: '{map_name}'"
+            f"{'' if map_name in ROBOT_SPAWN_POSE else ' -> default'})"
+        )
         self.robot = self.world.scene.add(
             WheeledRobot(
                 prim_path=robot_prim_path,
@@ -327,7 +381,7 @@ class TeleopHuNavSim(Node):
                 wheel_dof_names=robot_config["wheel_dof_names"],
                 create_robot=True,
                 usd_path=robot_path,
-                position=ROBOT_SPAWN_POSE.get(map_name, DEFAULT_ROBOT_SPAWN),
+                position=self.robot_spawn_pose,
                 orientation=[0, 0, 0, 1],
             )
         )
@@ -353,6 +407,8 @@ class TeleopHuNavSim(Node):
             config_file_path=hunav_config,
             robot_prim_path=robot_prim_path,
             robot=self.robot,
+            terrain_follow=self.terrain_follow,
+            step_height=self.step_height,
         )
 
         self.create_ros_clock_action_graph()
@@ -471,14 +527,65 @@ class TeleopHuNavSim(Node):
         except Exception as e:
             print(f"Error creating ROS_Clock action graph: {e}")
 
+    def _warn_if_robot_moved(self, tolerance=3.0):
+        """
+        Warn if the robot is not where it was spawned.
+
+        Coincident ground colliders can make PhysX resolve the initial overlap
+        explosively -- at the brownstone origin that threw the robot ~115 m at
+        ~23 m/s, which looks exactly like "the robot is missing". Catching it
+        here turns a confusing hunt into one log line.
+        """
+        try:
+            pos, _ = self.robot.get_world_pose()
+        except Exception as e:  # robot not initialised; nothing useful to say
+            print(f"[hunav] Could not read robot pose: {e}")
+            return
+        want = self.robot_spawn_pose
+        drift = math.hypot(pos[0] - want[0], pos[1] - want[1])
+        if drift > tolerance:
+            print(
+                f"[hunav] WARNING: robot is {drift:.1f} m from its spawn "
+                f"({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f} vs {tuple(want)}). "
+                "This usually means PhysX ejected it from overlapping ground "
+                "colliders at the spawn point -- pick a different spawn for this "
+                "world in ROBOT_SPAWN_POSE."
+            )
+        else:
+            print(
+                f"[hunav] Robot settled at "
+                f"({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})"
+            )
+
     def run(self):
         self.world.reset()
+        # world.reset() starts the timeline, and that is where the navmesh and
+        # crowd debug overlays come back: they are authored in the /persistent
+        # settings tree, which is copied over the live one on a stage or timeline
+        # reset. Rebuilding those overlays happens inside the per-frame agent
+        # simulation, so leaving them on costs seconds per frame rather than
+        # merely drawing something nobody looks at.
+        if self.hunav.driver is not None:
+            self.hunav.driver.suppress_debug_geometry()
+        self._warn_if_robot_moved()
         self.physx_interface = omni.physx.get_physx_interface()
         self.physx_sub = self.physx_interface.subscribe_physics_step_events(
             self._on_physics_step
         )
         self.hunav.send_agents_msg()
+        # One-shot skinning check, once the agents have been driven long enough
+        # for the answer to mean anything. Agents that track their goals while
+        # their rig never moves look identical to working ones in the logs.
+        locomotion_checked = False
+        steps = 0
         while simulation_app.is_running() and not self._shutdown_requested:
             self.world.step(render=True)
+            steps += 1
+            if not locomotion_checked and steps == 250:
+                locomotion_checked = True
+                try:
+                    self.hunav.report_locomotion_health()
+                except Exception as exc:
+                    print(f"[hunav] locomotion check errored: {exc}", flush=True)
             wheel_action = self.diff_controller.forward([self.cmd_lin, self.cmd_ang])
             self.robot.apply_wheel_actions(wheel_action)

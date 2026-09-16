@@ -17,11 +17,6 @@ import os
 # cannot be determined.
 _FALLBACK_MAJOR = 6
 
-# Bucket for assets that no longer ship with current Isaac Sim releases.
-LEGACY_ASSETS_ROOT = (
-    "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/4.5"
-)
-
 # Robot USD locations, keyed by robot name then by the oldest Isaac Sim major
 # version that uses the path. A value of None means the asset has no equivalent
 # in that release and the robot is unavailable.
@@ -109,29 +104,3 @@ def is_robot_available(robot_key: str, major: int = None) -> bool:
         # Robots backed by a bundled USD (carter_ROS) are not in the table and
         # are always available.
         return True
-
-
-def biped_setup_url(assets_root: str, major: int = None) -> str:
-    """
-    Return the URL of Biped_Setup.usd, the source skeleton used for animation
-    retargeting.
-
-    Isaac Sim 5.0+ removed both Biped_Setup.usd and the biped_demo/ subtree it
-    references, and there is no replacement in the current buckets, so on those
-    releases this resolves against the 4.5 bucket. Biped_Setup.usd references
-    its animations and skeleton by *relative* path, so it must be loaded from a
-    root that also holds Isaac/People/Animations/ and
-    Isaac/People/Characters/biped_demo/ -- vendoring the single file locally
-    does not work.
-
-    Set HUNAV_BIPED_SETUP_USD to override with a local collected copy.
-    """
-    override = os.environ.get("HUNAV_BIPED_SETUP_USD")
-    if override:
-        return override
-
-    if major is None:
-        major = get_isaac_major()
-
-    root = assets_root if major < 5 else LEGACY_ASSETS_ROOT
-    return os.path.join(root, "Isaac/People/Characters/Biped_Setup.usd")

@@ -408,7 +408,30 @@ Configuration files are searched in: {CONFIG_DIR}
         action="store_true", 
         help="Enable verbose output"
     )
-    
+
+    # Experimental terrain options. Both default off, so existing scenarios are
+    # unaffected. Only 'brownstone' currently has non-flat ground.
+    parser.add_argument(
+        "--flat-ground",
+        action="store_true",
+        help="Experimental: hide raised terrain and put a flat collider at z=0, "
+             "giving warehouse-like even ground"
+    )
+    parser.add_argument(
+        "--terrain-follow",
+        action="store_true",
+        help="Experimental: raycast the ground each tick so agents walk over "
+             "raised terrain instead of through it"
+    )
+    parser.add_argument(
+        "--step-height",
+        type=float,
+        default=0.25,
+        metavar="M",
+        help="Max step an agent can climb with --terrain-follow, in metres "
+             "(default: 0.25)"
+    )
+
     return parser.parse_args()
 
 
@@ -530,7 +553,15 @@ def main():
     save_last_config(config_path, world, robot)
     
     # Launch simulation
-    launch_simulation(world, config_path, robot, args.verbose)
+    launch_simulation(
+        world,
+        config_path,
+        robot,
+        args.verbose,
+        flat_ground=args.flat_ground,
+        terrain_follow=args.terrain_follow,
+        step_height=args.step_height,
+    )
 
 
 def interactive_config_selection():
@@ -953,7 +984,15 @@ def interactive_config_selection():
     return config_path
 
 
-def launch_simulation(world, config_path, robot, verbose=False):
+def launch_simulation(
+    world,
+    config_path,
+    robot,
+    verbose=False,
+    flat_ground=False,
+    terrain_follow=False,
+    step_height=0.25,
+):
     """Launch the simulation with the specified parameters."""
     print_info("Initializing simulation...")
     
@@ -995,6 +1034,9 @@ def launch_simulation(world, config_path, robot, verbose=False):
             map_name=world,
             hunav_config=config_path,
             robot_name=robot,
+            flat_ground=flat_ground,
+            terrain_follow=terrain_follow,
+            step_height=step_height,
         )
         
         print_success("Simulation launched successfully!")

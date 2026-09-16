@@ -20,10 +20,18 @@ class WorldBuilder:
     def load_map(self, map_name: str):
         """
         Looks for `map_name.usd` inside the 'worlds' folder under base_path and opens it.
+
+        Returns True if the stage was opened. A missing map is reported but not
+        raised, so callers that post-process the stage must check the result.
         """
         map_path = os.path.join(self.base_path, "worlds", f"{map_name}.usd")
         if os.path.exists(map_path):
             self.usd_context.open_stage(map_path)
             print(f"Map '{map_name}' loaded from: {map_path}")
-        else:
-            print(f"[WorldBuilder] Error: map '{map_name}' not found at {map_path}")
+            return True
+        print(f"[WorldBuilder] Error: map '{map_name}' not found at {map_path}")
+        return False
+
+    def get_stage(self):
+        """The currently open USD stage, or None if nothing has been opened."""
+        return self.usd_context.get_stage()
