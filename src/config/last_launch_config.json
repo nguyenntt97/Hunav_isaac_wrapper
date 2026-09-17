@@ -2,6 +2,6 @@
   "config_path": "/workspace/Hunav_isaac_wrapper/src/scenarios/brownstone_agents.yaml",
   "world": "brownstone",
   "robot": "carter_ROS",
-  "timestamp": 1789538088.6411552,
+  "timestamp": 1789616068.5341325,
   "config_name": "brownstone_agents.yaml"
 }

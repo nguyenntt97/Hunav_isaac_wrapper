@@ -8,6 +8,11 @@ Contains the TeleopHuNavSim class which combines:
 - Agent management via HuNavManager.
 """
 import os as _os
+import sys as _sys
+
+_repo_root = _os.path.abspath(_os.path.join(_os.path.dirname(__file__), "..", ".."))
+if _os.path.exists(_repo_root) and _repo_root not in _sys.path:
+    _sys.path.insert(0, _repo_root)
 
 from isaacsim import SimulationApp
 
@@ -252,11 +257,13 @@ class TeleopHuNavSim(Node):
         flat_ground=False,
         terrain_follow=False,
         step_height=DEFAULT_STEP_HEIGHT,
+        navmesh_helper=False,
     ):
         super().__init__("hunav_sim")
         self._shutdown_requested = False
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
+        self.navmesh_helper = navmesh_helper or _env_flag("HUNAV_NAVMESH_HELPER") or _env_flag("NAVMESH_HELPER")
 
         # Assets root. Isaac Sim 5.0+ raises instead of returning None, so both
         # failure modes have to be handled; every built-in robot and character
@@ -415,6 +422,32 @@ class TeleopHuNavSim(Node):
 
         self.hunav.initialize_agents()
         self.hunav.initialize_hunav_nodes()
+
+        if self.navmesh_helper:
+            self._init_navmesh_helper()
+
+    def _init_navmesh_helper(self):
+        """Initialize navmesh visualizer and interactive control window."""
+        try:
+            try:
+                from new_behavior.nav_mesh_plugin import build_and_visualize_navmesh, show_navmesh_window
+            except ImportError:
+                from hunav_isaac_wrapper.nav_mesh_plugin import build_and_visualize_navmesh, show_navmesh_window
+
+            stage = self.builder.get_stage() if hasattr(self, "builder") else None
+            result = build_and_visualize_navmesh(stage=stage)
+            print(f"[hunav] NavMesh visual surface created at: {result.get('mesh_path')}", flush=True)
+            print(f"[hunav] NavMesh outlines created: {len(result.get('outlines', []))} lines", flush=True)
+
+            # Open interactive UI window if UI is active (local GUI or WebRTC livestream)
+            if not _env_flag("HEADLESS") or LIVESTREAM:
+                try:
+                    self._navmesh_window = show_navmesh_window()
+                    print("[hunav] NavMesh interactive control window opened.", flush=True)
+                except Exception as ui_err:
+                    print(f"[hunav] Note: Could not open NavMesh UI window ({ui_err})", flush=True)
+        except Exception as e:
+            print(f"[hunav] Warning: Failed to initialize NavMesh helper: {e}", flush=True)
 
     def _signal_handler(self, signum, frame):
         """

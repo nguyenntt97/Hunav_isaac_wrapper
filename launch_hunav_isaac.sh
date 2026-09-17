@@ -18,6 +18,18 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
+# 1. Source ROS 2 and workspace if needed
+if [ -z "$ROS_DISTRO" ]; then
+    if [ -f "/opt/ros/jazzy/setup.bash" ]; then
+        source /opt/ros/jazzy/setup.bash
+    elif [ -f "/opt/ros/humble/setup.bash" ]; then
+        source /opt/ros/humble/setup.bash
+    fi
+fi
+if [ -f "/workspace/hunav_ws/install/setup.bash" ]; then
+    source /workspace/hunav_ws/install/setup.bash
+fi
+
 # Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MAIN_SCRIPT="$SCRIPT_DIR/src/scripts/main.py"
@@ -79,19 +91,50 @@ if [ -z "$ISAAC_PYTHON" ]; then
     exit 1
 fi
 
+# Check for environment-based NavMesh helper flag (HUNAV_NAVMESH_HELPER=1 or NAVMESH_HELPER=1)
+if [ "${HUNAV_NAVMESH_HELPER:-0}" = "1" ] || [ "${NAVMESH_HELPER:-0}" = "1" ] || [ "${HUNAV_NAVMESH_HELPER:-}" = "true" ] || [ "${NAVMESH_HELPER:-}" = "true" ]; then
+    has_navmesh_flag=false
+    for arg in "$@"; do
+        if [ "$arg" = "--navmesh-helper" ]; then
+            has_navmesh_flag=true
+            break
+        fi
+    done
+    if [ "$has_navmesh_flag" = false ]; then
+        echo -e "${GREEN}Enabling NavMesh helper from environment (HUNAV_NAVMESH_HELPER=1)${NC}"
+        set -- "$@" --navmesh-helper
+    fi
+fi
+
 # Parse arguments
 if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
     echo "HuNav Isaac Wrapper Launcher"
     echo ""
     echo "Usage:"
-    echo "  $0                    # Interactive mode"
-    echo "  $0 [scenario.yaml]    # Launch with specific scenario"
-    echo "  $0 [args...]          # Pass arguments to main.py"
+    echo "  $0                                      # Interactive mode"
+    echo "  $0 [scenario.yaml] [options...]         # Launch with specific scenario"
+    echo "  $0 [args...]                            # Pass arguments to main.py"
+    echo ""
+    echo "Options forwarded to main.py:"
+    echo "  --navmesh-helper                         # Auto-visualize NavMesh (/World/navmeshmesh) & open UI window"
+    echo "  --flat-ground                            # Flatten terrain collision for even ground"
+    echo "  --terrain-follow                         # Raycast terrain elevation dynamically for agents"
+    echo "  --step-height M                          # Max step height in metres (default: 0.25)"
+    echo "  --batch, -b                              # Batch mode (skip interactive prompts)"
+    echo ""
+    echo "Environment variables:"
+    echo "  HUNAV_NAVMESH_HELPER=1                   # Same as --navmesh-helper"
+    echo "  LIVESTREAM=1                             # Serve viewport via WebRTC on port 49100"
+    echo "  LIVESTREAM_PUBLIC_IP=<IP>                # Announce public IP to WebRTC clients"
+    echo "  HUNAV_CROWD_PROFILING=1                  # Print per-frame crowd update timings"
+    echo "  HUNAV_ANIM_DEBUG=1                       # Print debug logs for agent animations"
     echo ""
     echo "Examples:"
-    echo "  $0                              # Show interactive menu"
-    echo "  $0 warehouse_agents.yaml        # Launch warehouse scenario"
-    echo "  $0 --config myfile.yaml --batch  # Batch mode"
+    echo "  $0                                      # Show interactive menu"
+    echo "  $0 warehouse_agents.yaml                # Launch warehouse scenario"
+    echo "  $0 warehouse_agents.yaml --navmesh-helper # Launch with NavMesh visualizer and UI"
+    echo "  $0 --config brownstone_agents.yaml --flat-ground --navmesh-helper --batch"
+    echo "  HUNAV_NAVMESH_HELPER=1 $0 --config brownstone_agents.yaml --flat-ground --batch"
     echo ""
     exit 0
 elif [ $# -eq 0 ]; then
@@ -105,7 +148,7 @@ elif [ $# -eq 1 ] && [[ ! "$1" =~ ^-- ]]; then
 else
     # Multiple arguments or arguments that start with --
     if [ $# -ge 2 ] && [[ ! "$1" =~ ^-- ]]; then
-        # First argument is likely a scenario file, convert it to --config format
+        # First argument is a scenario file, convert it to --config format
         SCENARIO="$1"
         shift  # Remove first argument
         echo -e "${GREEN}Launching with scenario: $SCENARIO and additional arguments: $@${NC}"

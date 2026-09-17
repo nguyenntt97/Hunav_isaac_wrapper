@@ -1,3 +1,6 @@
 [submodule "third_party/ov_navmesh"]
 	path = third_party/ov_navmesh
 	url = https://github.com/cadop/ov_navmesh
+[submodule "third_party/crowdes"]
+	path = third_party/crowdes
+	url = https://github.com/InhwanBae/Crowd-Behavior-Generation

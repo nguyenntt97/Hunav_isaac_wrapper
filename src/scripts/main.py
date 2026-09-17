@@ -21,11 +21,15 @@ import time
 import json
 from pathlib import Path
 
-# Add the hunav_isaac_wrapper package to the Python path
+# Add the hunav_isaac_wrapper package and repository root to the Python path
 script_dir = os.path.dirname(os.path.abspath(__file__))
-package_dir = os.path.join(os.path.dirname(script_dir), "hunav_isaac_wrapper")
-if os.path.exists(package_dir):
-    sys.path.insert(0, os.path.dirname(script_dir))
+src_dir = os.path.dirname(script_dir)
+workspace_root = os.path.dirname(src_dir)
+package_dir = os.path.join(src_dir, "hunav_isaac_wrapper")
+if os.path.exists(package_dir) and src_dir not in sys.path:
+    sys.path.insert(0, src_dir)
+if os.path.exists(workspace_root) and workspace_root not in sys.path:
+    sys.path.insert(0, workspace_root)
 
 import rclpy
 
@@ -431,6 +435,14 @@ Configuration files are searched in: {CONFIG_DIR}
         help="Max step an agent can climb with --terrain-follow, in metres "
              "(default: 0.25)"
     )
+    _env_navmesh = os.environ.get("HUNAV_NAVMESH_HELPER", os.environ.get("NAVMESH_HELPER", "0")).lower() in ("1", "true", "yes", "on")
+    parser.add_argument(
+        "--navmesh-helper",
+        action="store_true",
+        default=_env_navmesh,
+        help="Initialize NavMesh helper: automatically visualizes the navigation mesh "
+             "on stage and opens the interactive NavMesh control panel window."
+    )
 
     return parser.parse_args()
 
@@ -540,9 +552,10 @@ def main():
     print(f"  {Colors.OKCYAN}Agents:{Colors.ENDC} {os.path.basename(config_path)}")
     print(f"  {Colors.OKCYAN}Robot:{Colors.ENDC} {robot}")
     print(f"  {Colors.OKCYAN}Config Path:{Colors.ENDC} {config_path}")
+    print(f"  {Colors.OKCYAN}NavMesh Helper:{Colors.ENDC} {'Enabled' if args.navmesh_helper else 'Disabled'}")
     print(f"{Colors.BOLD}{'─' * 70}{Colors.ENDC}\n")
     
-    if not args.batch:
+    if not args.batch and sys.stdin.isatty():
         try:
             input(f"{Colors.BOLD}Press Enter to launch simulation (Ctrl+C to cancel)...{Colors.ENDC}")
         except (KeyboardInterrupt, EOFError):
@@ -561,6 +574,7 @@ def main():
         flat_ground=args.flat_ground,
         terrain_follow=args.terrain_follow,
         step_height=args.step_height,
+        navmesh_helper=args.navmesh_helper,
     )
 
 
@@ -992,6 +1006,7 @@ def launch_simulation(
     flat_ground=False,
     terrain_follow=False,
     step_height=0.25,
+    navmesh_helper=False,
 ):
     """Launch the simulation with the specified parameters."""
     print_info("Initializing simulation...")
@@ -1037,6 +1052,7 @@ def launch_simulation(
             flat_ground=flat_ground,
             terrain_follow=terrain_follow,
             step_height=step_height,
+            navmesh_helper=navmesh_helper,
         )
         
         print_success("Simulation launched successfully!")
