@@ -123,6 +123,7 @@ import os
 import signal
 import subprocess
 from pathlib import Path
+import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from isaacsim.core.api import World
@@ -137,6 +138,7 @@ import omni.graph.core as og
 # Import the WorldBuilder and HuNavManager modules.
 from .world_builder import WorldBuilder
 from .hunav_manager import HuNavManager
+from .behavior_agent import BehaviorAgentDriver
 from .terrain import apply_flat_ground
 from .asset_paths import (
     get_isaac_major,
@@ -258,12 +260,29 @@ class TeleopHuNavSim(Node):
         terrain_follow=False,
         step_height=DEFAULT_STEP_HEIGHT,
         navmesh_helper=False,
+        author_mode=False,
     ):
         super().__init__("hunav_sim")
         self._shutdown_requested = False
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
         self.navmesh_helper = navmesh_helper or _env_flag("HUNAV_NAVMESH_HELPER") or _env_flag("NAVMESH_HELPER")
+
+        # Authoring mode builds the world and the navmesh and stops there: no
+        # characters, no robot, no hunav_loader / hunav_agent_manager
+        # subprocesses. The scenario being edited is the one the *next* launch
+        # will read, because the YAML is read once at startup and there is no
+        # reload path -- so editing alongside a live simulation would be
+        # editing something the running agents can never pick up.
+        self.author_mode = author_mode or _env_flag("HUNAV_AUTHOR_SCENARIO")
+        if self.author_mode:
+            # The whole point is the helper window.
+            self.navmesh_helper = True
+        self.hunav = None
+        self.robot = None
+        self.driver = None
+        self.scenario_manager = None
+        self._navmesh_window = None
 
         # Assets root. Isaac Sim 5.0+ raises instead of returning None, so both
         # failure modes have to be handled; every built-in robot and character
@@ -315,6 +334,14 @@ class TeleopHuNavSim(Node):
 
         if map_name == "empty_world":
             self.world.scene.add_default_ground_plane()
+
+        self.map_name = map_name
+
+        # Everything below this point is the runtime: robot, characters, ROS
+        # nodes. Authoring needs none of it.
+        if self.author_mode:
+            self._build_authoring(map_name)
+            return
 
         # Define configuration for each wheeled robot available. The USD paths of
         # the built-in robots moved in Isaac Sim 5.0, so they are resolved through
@@ -425,6 +452,93 @@ class TeleopHuNavSim(Node):
 
         if self.navmesh_helper:
             self._init_navmesh_helper()
+
+    def _build_authoring(self, map_name):
+        """Mode A: bake the navmesh over the whole map and open the editor.
+
+        The navmesh is baked through BehaviorAgentDriver, not through the
+        plugin's own build_navmesh. The two disagree materially -- agent radius
+        50 vs 60 cm, step height 25 vs 90 cm, slope 20 vs 45 degrees, island
+        radius 500 vs 80 cm -- so authoring against the plugin's mesh would
+        validate spawns on a surface the simulator never produces.
+
+        The volume comes from the map's own extent rather than from the agent
+        poses. Deriving it from the poses, as the runtime does, is circular
+        here: you could only ever place an agent inside the box the current
+        poses already describe.
+        """
+        from .behavior_agent import NAVMESH_SETTINGS
+        from .scenario import paths as scenario_paths
+        from .scenario.bake import (
+            ground_z_for_map,
+            navmesh_settings_digest,
+            sampling_cm_for_extent,
+            scene_bounds,
+        )
+        from .scenario.spec import NavmeshProvenance
+
+        stage = self.builder.get_stage()
+        maps_dir = scenario_paths.maps_dir()
+
+        ground_z = ground_z_for_map(map_name, maps_dir)
+        bounds = scene_bounds(map_name, maps_dir, ground_z=ground_z)
+        if bounds is None:
+            print(
+                f"[hunav] No map description for '{map_name}' in {maps_dir}; "
+                "falling back to the world's own bounds."
+            )
+
+        self.driver = BehaviorAgentDriver(stage, get_assets_root_path(), dt=1.0 / 20.0)
+        self.driver.configure_navmesh()
+        self.driver.ensure_navmesh_volume(bounds=bounds)
+        self.driver.bake_navmesh(
+            extent=self.driver.navmesh_extent, ground_z=ground_z
+        )
+
+        extent = self.driver.navmesh_extent or (0.0, 0.0, 0.0)
+        provenance = NavmeshProvenance(
+            settings_digest=navmesh_settings_digest(NAVMESH_SETTINGS),
+            volume_min=tuple(bounds[0]) if bounds else (0.0, 0.0, 0.0),
+            volume_max=tuple(bounds[1]) if bounds else (0.0, 0.0, 0.0),
+            ground_z=float(ground_z),
+            sampling_cm=float(
+                getattr(self.driver, "navmesh_sampling", None)
+                or sampling_cm_for_extent(
+                    extent, NAVMESH_SETTINGS["agentSamplingDistance"], 1000
+                )
+            ),
+        )
+
+        self._init_navmesh_helper()
+
+        if self._navmesh_window is not None:
+            manager = self._navmesh_window._ensure_scenario_manager()
+            manager.set_provenance(provenance)
+            self.scenario_manager = manager
+
+        print(
+            "\n[hunav] Scenario authoring mode.\n"
+            f"        Map:       {map_name}\n"
+            f"        NavMesh:   {provenance.sampling_cm:.1f} cm sampling, "
+            f"digest {provenance.settings_digest}\n"
+            f"        Scenarios: {scenario_paths.scenarios_dir()}\n"
+            f"        Trees:     {scenario_paths.behavior_trees_dir()}\n"
+            "        Use the Navmesh window's 'Agent Spawns & Goals' section.\n"
+            "        Export writes the YAML and one behavior tree per agent;\n"
+            "        relaunch without --author-scenario to run what you wrote.\n",
+            flush=True,
+        )
+
+    def run_authoring(self):
+        """Mode A loop: keep the app responsive, but never start physics.
+
+        world.reset() would start the timeline, and the behavior system would
+        begin looking for agents that deliberately do not exist here.
+        """
+        print("[hunav] Authoring session ready. Ctrl+C to exit.", flush=True)
+        while simulation_app.is_running() and not self._shutdown_requested:
+            simulation_app.update()
+            rclpy.spin_once(self, timeout_sec=0.0)
 
     def _init_navmesh_helper(self):
         """Initialize navmesh visualizer and interactive control window."""
@@ -591,6 +705,12 @@ class TeleopHuNavSim(Node):
             )
 
     def run(self):
+        # Mode A never starts physics or the timeline: there are no agents to
+        # step and no robot to drive.
+        if self.author_mode:
+            self.run_authoring()
+            return
+
         self.world.reset()
         # world.reset() starts the timeline, and that is where the navmesh and
         # crowd debug overlays come back: they are authored in the /persistent

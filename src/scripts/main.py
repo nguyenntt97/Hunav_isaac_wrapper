@@ -443,6 +443,15 @@ Configuration files are searched in: {CONFIG_DIR}
         help="Initialize NavMesh helper: automatically visualizes the navigation mesh "
              "on stage and opens the interactive NavMesh control panel window."
     )
+    _env_author = os.environ.get("HUNAV_AUTHOR_SCENARIO", "0").lower() in ("1", "true", "yes", "on")
+    parser.add_argument(
+        "--author-scenario",
+        action="store_true",
+        default=_env_author,
+        help="Scenario authoring mode: load the map, bake the navmesh over the whole "
+             "of it, and open the editor. No agents, no robot, no HuNavSim nodes -- "
+             "this writes the scenario the NEXT launch reads."
+    )
 
     return parser.parse_args()
 
@@ -553,6 +562,7 @@ def main():
     print(f"  {Colors.OKCYAN}Robot:{Colors.ENDC} {robot}")
     print(f"  {Colors.OKCYAN}Config Path:{Colors.ENDC} {config_path}")
     print(f"  {Colors.OKCYAN}NavMesh Helper:{Colors.ENDC} {'Enabled' if args.navmesh_helper else 'Disabled'}")
+    print(f"  {Colors.OKCYAN}Mode:{Colors.ENDC} {'AUTHOR (no agents, no ROS nodes)' if args.author_scenario else 'RUN'}")
     print(f"{Colors.BOLD}{'─' * 70}{Colors.ENDC}\n")
     
     if not args.batch and sys.stdin.isatty():
@@ -575,6 +585,7 @@ def main():
         terrain_follow=args.terrain_follow,
         step_height=args.step_height,
         navmesh_helper=args.navmesh_helper,
+        author_scenario=args.author_scenario,
     )
 
 
@@ -1007,6 +1018,7 @@ def launch_simulation(
     terrain_follow=False,
     step_height=0.25,
     navmesh_helper=False,
+    author_scenario=False,
 ):
     """Launch the simulation with the specified parameters."""
     print_info("Initializing simulation...")
@@ -1053,9 +1065,13 @@ def launch_simulation(
             terrain_follow=terrain_follow,
             step_height=step_height,
             navmesh_helper=navmesh_helper,
+            author_mode=author_scenario,
         )
-        
-        print_success("Simulation launched successfully!")
+
+        if author_scenario:
+            print_success("Authoring session launched.")
+        else:
+            print_success("Simulation launched successfully!")
         print_info("Use Ctrl+C to stop the simulation.")
         
         if verbose:

@@ -11,6 +11,32 @@ framework Isaac Sim 6 actually ships, instead of emulating the Isaac Sim 4.x
 | Trigger | Agents render in bind pose ("T-pose"); root cause traced to runtime retargeting |
 | Scope | Character animation and locomotion only. HuNavSim, its behavior trees, ROS 2 and the world/terrain work are untouched |
 
+## Two topics live here
+
+Locomotion (this page, `design.md`, `differences.md`) and **scenario authoring**
+(`scenario_init_design.md`), which is about where agents start, where they walk and how
+they behave — not how their bodies render that motion.
+
+- **[scenario_init_design.md](scenario_init_design.md)** — the two modes (author a
+  scenario, then run it), what actually drives a HuNav agent, and the implementation.
+- **[tasks/hunav_runtime_contract.md](tasks/hunav_runtime_contract.md)** — the traced
+  facts that design rests on, with source line references into `hunav_sim`. Read this
+  before touching scenarios, goals or behaviors: most of what it records fails silently.
+
+Quick start for scenario work:
+
+```bash
+# Mode A - author, headless
+/isaac-sim/python.sh src/scripts/init_scenario.py --map brownstone --agents 8 \
+    --behaviors Regular:5,Curious:2,Scared:1 --goals 15 --ring 5 --seed 0
+
+# Mode A - author, interactively in the viewport
+./launch_hunav_isaac.sh --world brownstone --author-scenario --flat-ground --batch
+
+# Mode B - run what you authored
+./launch_hunav_isaac.sh --config brownstone_agents.yaml --flat-ground --batch
+```
+
 ## Read in this order
 
 1. **[differences.md](differences.md)** — what changed between Isaac Sim 4.x and 6.x,

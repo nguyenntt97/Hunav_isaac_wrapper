@@ -41,6 +41,7 @@ from .behavior_agent import (
     BehaviorAgentError,
     STARTUP_EXTENSIONS as BEHAVIOR_EXTENSIONS,
 )
+from .scenario.spec import BEHAVIOR_TYPES, FORCE_FACTOR_RANGES, VEL_RANGE
 
 # These are requested at app startup via SimulationApp's extra_args (see
 # STARTUP_EXTENSIONS in teleop_hunav_sim.py), which is the only point at which
@@ -144,6 +145,9 @@ class HuNavManager:
 
         self.robot_prim = None
         self._last_yaw = {}
+        # Agents whose behavior type we have already complained about, so a
+        # bad scenario logs once per agent rather than once per tick.
+        self._warned_behavior_types = set()
         self._anim_debug_ticks = {}
 
         if config_file_path is not None:
@@ -794,6 +798,34 @@ class HuNavManager:
         robot.closest_obs = []
         return robot
 
+    def _behavior_type_id(self, beh, agent_cfg):
+        """Map the scenario's behavior name onto the AgentBehavior enum.
+
+        The scenario schema spells the type as a string ("Regular",
+        "Impassive", ...) while the message carries the uint8. An unrecognised
+        name is a scenario bug that would otherwise present as agents quietly
+        ignoring the robot, so it is reported once per agent and falls back to
+        Regular rather than to the zero that caused the original problem.
+        """
+        raw = beh.get("type", "Regular")
+
+        if isinstance(raw, int) or (isinstance(raw, str) and raw.isdigit()):
+            type_id = int(raw)
+            if type_id in BEHAVIOR_TYPES.values():
+                return type_id
+        elif raw in BEHAVIOR_TYPES:
+            return BEHAVIOR_TYPES[raw]
+
+        agent_id = agent_cfg.get("id", "?")
+        if agent_id not in self._warned_behavior_types:
+            self._warned_behavior_types.add(agent_id)
+            print(
+                f"[HuNavManager] agent {agent_id}: unknown behavior type {raw!r}; "
+                f"expected one of {', '.join(BEHAVIOR_TYPES)}. Falling back to "
+                "Regular."
+            )
+        return BEHAVIOR_TYPES["Regular"]
+
     def _create_agent_msg(self, agent_prim, index):
         agent_ref = self.config["hunav_loader"]["ros__parameters"]["agents"][index]
         agent_cfg = self.config["hunav_loader"]["ros__parameters"][agent_ref]
@@ -849,62 +881,75 @@ class HuNavManager:
         # Behavior
         beh = agent_cfg["behavior"]
         configuration = int(beh["configuration"])
-        
-        # SFM parameter configuration constants
+
+        # The behaviour *type* is what decides how the robot enters this agent's
+        # social-force computation: BEH_REGULAR pushes it in as another human,
+        # BEH_IMPASSIVE as an obstacle, and anything the agent manager does not
+        # recognise falls through to a branch that leaves the robot out
+        # altogether. Sending 0 -- which is what an unset field is, and what this
+        # wrapper used to send -- silently selected that last case for every
+        # agent in every scenario.
+        behavior_type = self._behavior_type_id(beh, agent_cfg)
+
+        # SFM defaults applied when configuration is BEH_CONF_DEFAULT.
+        #
+        # NOTE: these are the values this wrapper has always used, and they are
+        # goal/obstacle swapped relative to hunav_loader's own defaults (which
+        # are goal 2.0, obstacle 10.0, matching upstream lightsfm). The wrapper's
+        # numbers are the ones the simulation integrates, so they are left alone
+        # here rather than changed underneath the four shipped scenarios.
+        # Author new scenarios with configuration 1 and the question does not
+        # arise -- see new_behavior/scenario_init_design.md.
         DEFAULT_SFM_PARAMS = {
             "goal_force_factor": 10.0,
             "obstacle_force_factor": 2.0,
-            "social_force_factor": 5.0
+            "social_force_factor": 5.0,
         }
-        
-        SFM_CONSTRAINTS = {
-            "goal_force_factor": (5.0, 10.0),
-            "obstacle_force_factor": (0.5, 5.0),
-            "social_force_factor": (5.0, 20.0)
-        }
-        
+
         def clamp_value(value: float, min_val: float, max_val: float) -> float:
             """Constrain value within specified range."""
             return max(min_val, min(value, max_val))
-        
+
+        authored = {
+            "social_force_factor": float(beh["social_force_factor"]),
+            "goal_force_factor": float(beh["goal_force_factor"]),
+            "obstacle_force_factor": float(beh["obstacle_force_factor"]),
+            "other_force_factor": float(beh["other_force_factor"]),
+        }
+
         # Set SFM parameters based on configuration type
-        if configuration == 0:  # Default Isaac Sim configuration
+        if configuration == 0:  # Default configuration
             sfm_params = DEFAULT_SFM_PARAMS.copy()
-            sfm_params["other_force_factor"] = float(beh["other_force_factor"])
-        elif configuration == 1:  # Custom unconstrained configuration
-            sfm_params = {
-                "social_force_factor": float(beh["social_force_factor"]),
-                "goal_force_factor": float(beh["goal_force_factor"]),
-                "obstacle_force_factor": float(beh["obstacle_force_factor"]),
-                "other_force_factor": float(beh["other_force_factor"])
-            }
-        else:  # Other configurations with constraints
-            sfm_params = {
-                "social_force_factor": float(beh["social_force_factor"]),
-                "goal_force_factor": float(beh["goal_force_factor"]),
-                "obstacle_force_factor": float(beh["obstacle_force_factor"]),
-                "other_force_factor": float(beh["other_force_factor"])
-            }
-            
-            # Apply constraints for non-custom configurations
-            for param, (min_val, max_val) in SFM_CONSTRAINTS.items():
+            sfm_params["other_force_factor"] = authored["other_force_factor"]
+        elif configuration == 1:  # Custom, deliberately unconstrained
+            sfm_params = authored
+        else:  # Random configurations: clamp to the ranges hunav_loader uses,
+               # so the two ends of the pipeline agree on what is legal.
+            sfm_params = authored
+            for param, (min_val, max_val) in FORCE_FACTOR_RANGES.items():
                 if param in sfm_params:
                     sfm_params[param] = clamp_value(sfm_params[param], min_val, max_val)
-        
+
+        # duration/once/vel/dist drive the timed behaviours (Scared, Curious,
+        # Surprised, Threatening). They are optional in the scenario schema --
+        # the scenarios written before this wrapper sent them omit the keys --
+        # so fall back to hunav_loader's own declared defaults.
+        vel = clamp_value(float(beh.get("vel", 1.0)), *VEL_RANGE)
+
         agent.behavior = AgentBehavior(
-            # type=int(beh["type"]),
+            type=behavior_type,
             state=1,
             configuration=configuration,
-            # duration=float(beh["duration"]),
-            # once=beh["once"],
-            # vel=float(beh["vel"]),
-            # dist=float(beh["dist"]),
+            duration=float(beh.get("duration", 40.0)),
+            once=bool(beh.get("once", True)),
+            vel=vel,
+            dist=float(beh.get("dist", 0.0)),
             social_force_factor=sfm_params["social_force_factor"],
             goal_force_factor=sfm_params["goal_force_factor"],
             obstacle_force_factor=sfm_params["obstacle_force_factor"],
             other_force_factor=sfm_params["other_force_factor"],
         )
-        
+
         # Obstacle detection
         max_distance = 4.0
         agent.closest_obs = []

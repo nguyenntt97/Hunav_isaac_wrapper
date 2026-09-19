@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<root main_tree_to_execute="DefaultTree" BTCPP_format="4">
+  <TreeNodesModel>
+    <!-- Conditions -->
+    <Condition ID="IsGoalReached">
+      <input_port name="agent_id" type="int">1</input_port>
+    </Condition>
+    <Condition ID="IsRobotVisible">
+      <input_port name="agent_id" type="int">1</input_port>
+      <input_port name="distance" type="double" default="5.0"/>
+    </Condition>
+    <Condition ID="TimeExpiredCondition">
+      <input_port name="seconds" type="double" default="5.0"/>
+      <input_port name="ts" type="double" default="0.1"/>
+      <input_port name="only_once" type="bool" default="true"/>
+    </Condition>
+
+    <!-- Actions -->
+    <Action ID="UpdateGoal">
+      <input_port name="agent_id" type="int">1</input_port>
+    </Action>
+    <Action ID="SetGoal">
+      <input_port name="agent_id" type="int">1</input_port>
+      <input_port name="goal_id" type="int"/>
+    </Action>
+    <Action ID="RegularNav">
+      <input_port name="agent_id" type="int">1</input_port>
+      <input_port name="time_step" type="double" default="0.1"/>
+    </Action>
+    <Action ID="SurprisedNav">
+      <input_port name="agent_id" type="int">1</input_port>
+      <input_port name="time_step" type="double" default="0.1"/>
+      <input_port name="beh_duration" type="double" default="5.0"/>
+      <input_port name="only_once" type="bool" default="true"/>
+    </Action>
+    <Action ID="CuriousNav">
+      <input_port name="agent_id" type="int">1</input_port>
+      <input_port name="time_step" type="double" default="0.1"/>
+      <input_port name="beh_duration" type="double" default="5.0"/>
+      <input_port name="only_once" type="bool" default="true"/>
+      <input_port name="agent_vel" type="double" default="1.0"/>
+      <input_port name="stop_distance" type="double" default="0.5"/>
+    </Action>
+    <Action ID="ScaredNav">
+      <input_port name="agent_id" type="int">1</input_port>
+      <input_port name="time_step" type="double" default="0.1"/>
+      <input_port name="beh_duration" type="double" default="5.0"/>
+      <input_port name="only_once" type="bool" default="true"/>
+      <input_port name="runaway_vel" type="double" default="1.5"/>
+      <input_port name="scary_force_factor" type="double" default="1.0"/>
+    </Action>
+    <Action ID="ThreateningNav">
+      <input_port name="agent_id" type="int">1</input_port>
+      <input_port name="time_step" type="double" default="0.1"/>
+      <input_port name="beh_duration" type="double" default="5.0"/>
+      <input_port name="only_once" type="bool" default="true"/>
+      <input_port name="goal_dist" type="double" default="1.0"/>
+    </Action>
+  </TreeNodesModel>
+
+<BehaviorTree ID="DefaultTree">
+  <Fallback name="MainFallback">
+    <!-- Goal ring -->
+    <Sequence name="SetGoals">
+      <RunOnce>
+        <SetGoal agent_id="{id}" goal_id="9"/>
+      </RunOnce>
+      <RunOnce>
+        <SetGoal agent_id="{id}" goal_id="4"/>
+      </RunOnce>
+      <RunOnce>
+        <SetGoal agent_id="{id}" goal_id="11"/>
+      </RunOnce>
+      <Inverter>
+        <RunOnce>
+          <SetGoal agent_id="{id}" goal_id="3"/>
+        </RunOnce>
+      </Inverter>
+    </Sequence>
+    <!-- Navigation loop -->
+    <Sequence name="RegularNavigation">
+      <Inverter>
+        <IsGoalReached agent_id="{id}"/>
+      </Inverter>
+      <RegularNav agent_id="{id}" time_step="{dt}"/>
+    </Sequence>
+    <!-- Advance to the next goal -->
+    <UpdateGoal agent_id="{id}"/>
+  </Fallback>
+</BehaviorTree>
+</root>

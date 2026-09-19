@@ -25,10 +25,29 @@ from .core import NavmeshInterface
 from . import usd_utils
 
 
+CHARACTERS_SCOPE = "/World/Characters"
+
+
+def live_agents_present(stage) -> bool:
+    """Whether HuNav characters are already on stage.
+
+    Re-baking under live agents replaces the navmesh they are being steered on,
+    with settings that differ from the driver's on step height, slope and island
+    radius. Worse, the driver's baker records that a failed bake poisons the
+    process -- every later bake returns empty -- so one exploratory click can
+    make a correct bake impossible without restarting. The destructive buttons
+    refuse whenever this is true.
+    """
+    if stage is None:
+        return False
+    scope = stage.GetPrimAtPath(CHARACTERS_SCOPE)
+    return bool(scope and scope.IsValid() and scope.GetChildren())
+
+
 class NavmeshWindow:
     """Omniverse Kit UI window controlling NavMesh assignment, baking, and visualization."""
 
-    def __init__(self, title: str = "Navmesh", width: int = 320, height: int = 650):
+    def __init__(self, title: str = "Navmesh", width: int = 340, height: int = 900):
         if ui is None:
             raise RuntimeError("omni.ui is not available in this environment.")
 
@@ -39,8 +58,22 @@ class NavmeshWindow:
         self.start_prim = None
         self.end_prim = None
 
+        # Scenario authoring shares this window's adapter rather than building
+        # a second one, so both agree on whether a mesh is built and on which
+        # stage they are looking at.
+        self.scenario = None
+        self.read_only = live_agents_present(self.stage)
+
         self._window = ui.Window(title, width=width, height=height)
         self._build_ui()
+
+    def _ensure_scenario_manager(self):
+        """Create the ScenarioManager on first use, sharing this adapter."""
+        if self.scenario is None:
+            from .scenario_manager import ScenarioManager
+
+            self.scenario = ScenarioManager(adapter=self.navmesh, stage=self.stage)
+        return self.scenario
 
     def _build_ui(self):
         # Color palette matching original extension
@@ -75,6 +108,15 @@ class NavmeshWindow:
                         print("[NavMesh UI] Please select a mesh or hierarchy in the Stage tree first.")
 
                 def build_navmesh():
+                    if self.read_only:
+                        print(
+                            "[NavMesh UI] Agents are live. Re-baking now would replace "
+                            "the navmesh they are steered on, with settings that differ "
+                            "from the ones they were spawned against, and a failed bake "
+                            "poisons every later one. Relaunch with --author-scenario "
+                            "to bake and edit."
+                        )
+                        return
                     success = self.navmesh.build_navmesh(settings=self.navmesh_settings)
                     if success:
                         self.bld_btn.style = s_done
@@ -148,6 +190,12 @@ class NavmeshWindow:
                     self.end_prim = self.stage.GetPrimAtPath(item)
 
                 def clear_and_reset_navmesh():
+                    if self.read_only:
+                        print(
+                            "[NavMesh UI] Agents are live; clearing the navmesh would "
+                            "strand them. Relaunch with --author-scenario instead."
+                        )
+                        return
                     self.navmesh.reset_navmesh(clear_stage=True)
                     reset_btns()
                     if hasattr(self, "startprim_field"):
@@ -233,6 +281,178 @@ class NavmeshWindow:
                         with ui.HStack(height=28, spacing=4):
                             ui.Button("Set Settings", clicked_fn=set_settings)
                             ui.Button("Reset Settings", clicked_fn=reset_settings)
+
+                ui.Spacer(height=4)
+                self._build_scenario_section(s_red, s_yellow, s_green, s_done)
+
+    def _build_scenario_section(self, s_red, s_yellow, s_green, s_done):
+        """Agent spawns, goals and behaviors, as a view over a validated model.
+
+        Everything here edits a `ScenarioSpec` and redraws the pins from it. The
+        pins are never the source of truth: `init_scenario.py` produces the same
+        scenario headless, and this panel is where it gets inspected and nudged.
+        """
+
+        def report(notes):
+            for note in notes or []:
+                print(f"[NavMesh UI] {note}")
+
+        def load_scenario():
+            manager = self._ensure_scenario_manager()
+            try:
+                from .scenario_manager import scenario_paths
+
+                name = self.scenario_name_field.model.get_value_as_string().strip()
+                manager.load_scenario(scenario_paths.scenario_path(name))
+                self.load_btn.style = s_done
+                validate_scenario()
+            except Exception as exc:
+                print(f"[NavMesh UI] Load failed: {exc}")
+
+        def generate_scenario():
+            if self.read_only:
+                print("[NavMesh UI] Read-only: agents are live. Use --author-scenario.")
+                return
+            manager = self._ensure_scenario_manager()
+            try:
+                from .scenario_manager import parse_behavior_mix
+
+                mix_text = self.mix_field.model.get_value_as_string().strip()
+                manager.generate_scenario(
+                    map_name=self.map_field.model.get_value_as_string().strip(),
+                    num_agents=int(self.agents_int.get_value_as_int()),
+                    num_goals=int(self.goals_int.get_value_as_int()),
+                    goals_per_agent=int(self.ring_int.get_value_as_int()),
+                    behavior_mix=parse_behavior_mix(mix_text) if mix_text else None,
+                    seed=int(self.seed_int.get_value_as_int()),
+                    yaml_base_name=(
+                        self.scenario_name_field.model.get_value_as_string().strip()
+                        or None
+                    ),
+                )
+                self.generate_btn.style = s_done
+                validate_scenario()
+            except Exception as exc:
+                print(f"[NavMesh UI] Generate failed: {exc}")
+
+        def snap_pins():
+            manager = self._ensure_scenario_manager()
+            report(manager.sync_from_stage())
+            report(manager.snap_all())
+            validate_scenario()
+
+        def scatter_spawns():
+            manager = self._ensure_scenario_manager()
+            report(manager.sync_from_stage())
+            report(manager.scatter_spawns(min_separation=2.0))
+            validate_scenario()
+
+        def validate_scenario():
+            manager = self._ensure_scenario_manager()
+            if manager.spec is None:
+                print("[NavMesh UI] Nothing loaded yet.")
+                self.validate_btn.style = s_red
+                return
+            report(manager.sync_from_stage())
+            problems = manager.validate()
+            fatal = [p for p in problems if p.fatal]
+            for problem in problems:
+                print(f"[NavMesh UI] {problem}")
+            if fatal:
+                self.validate_btn.style = s_red
+                self.export_btn.style = s_red
+                print(f"[NavMesh UI] {len(fatal)} blocking problem(s); export refused.")
+            else:
+                self.validate_btn.style = s_done
+                self.export_btn.style = s_green
+                print("[NavMesh UI] Scenario is launchable.")
+
+        def export_scenario():
+            manager = self._ensure_scenario_manager()
+            try:
+                result = manager.export()
+                self.export_btn.style = s_done
+                print(
+                    f"[NavMesh UI] Exported {result['scenario']} and "
+                    f"{len(result['trees'])} behavior trees. Relaunch to run it: "
+                    "the scenario is read once, at startup."
+                )
+            except Exception as exc:
+                self.export_btn.style = s_red
+                print(f"[NavMesh UI] Export failed: {exc}")
+
+        def clear_pins():
+            manager = self._ensure_scenario_manager()
+            removed = manager.clear()
+            print(f"[NavMesh UI] Cleared pins: {removed or 'nothing on stage'}")
+
+        title = "Agent Spawns & Goals"
+        if self.read_only:
+            title += "  (read-only: agents are live)"
+
+        with ui.CollapsableFrame(title, collapsed=False):
+            with ui.VStack(spacing=3):
+                with ui.HStack(height=24, spacing=4):
+                    ui.Label("Scenario", width=70)
+                    self.scenario_name_field = ui.StringField(
+                        tooltip="Base name under src/scenarios, without .yaml"
+                    )
+                    self.scenario_name_field.model.set_value("brownstone_agents")
+
+                with ui.HStack(height=24, spacing=4):
+                    ui.Label("Map", width=70)
+                    self.map_field = ui.StringField(tooltip="Map name under src/maps")
+                    self.map_field.model.set_value("brownstone")
+
+                with ui.HStack(height=24, spacing=4):
+                    ui.Label("Agents", width=70)
+                    self.agents_int = ui.SimpleIntModel(8)
+                    ui.IntField(self.agents_int)
+                    ui.Label("Goals", width=45)
+                    self.goals_int = ui.SimpleIntModel(15)
+                    ui.IntField(self.goals_int)
+
+                with ui.HStack(height=24, spacing=4):
+                    ui.Label("Ring", width=70)
+                    self.ring_int = ui.SimpleIntModel(5)
+                    ui.IntField(self.ring_int)
+                    ui.Label("Seed", width=45)
+                    self.seed_int = ui.SimpleIntModel(0)
+                    ui.IntField(self.seed_int)
+
+                with ui.HStack(height=24, spacing=4):
+                    ui.Label("Mix", width=70)
+                    self.mix_field = ui.StringField(
+                        tooltip="e.g. Regular:5,Curious:2,Scared:1"
+                    )
+                    self.mix_field.model.set_value("Regular:5,Curious:2,Scared:1")
+
+                ui.Spacer(height=2)
+                self.load_btn = ui.Button(
+                    "Load Scenario", clicked_fn=load_scenario, style=s_yellow
+                )
+                self.generate_btn = ui.Button(
+                    "Generate on NavMesh",
+                    clicked_fn=generate_scenario,
+                    style=s_red if self.read_only else s_yellow,
+                )
+                self.snap_btn = ui.Button(
+                    "Snap Pins to NavMesh", clicked_fn=snap_pins, style=s_yellow
+                )
+                self.scatter_btn = ui.Button(
+                    "Scatter Spawns", clicked_fn=scatter_spawns, style=s_yellow
+                )
+                self.validate_btn = ui.Button(
+                    "Validate", clicked_fn=validate_scenario, style=s_yellow
+                )
+                self.export_btn = ui.Button(
+                    "Export YAML + Behavior Trees",
+                    clicked_fn=export_scenario,
+                    style=s_red,
+                )
+                self.clearpins_btn = ui.Button(
+                    "Clear Pins", clicked_fn=clear_pins, style=s_yellow
+                )
 
     def destroy(self):
         if self._window:
