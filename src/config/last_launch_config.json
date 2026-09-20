@@ -1,7 +1,7 @@
 {
-  "config_path": "/workspace/Hunav_isaac_wrapper/src/scenarios/warehouse_generated.yaml",
-  "world": "warehouse",
-  "robot": "carter_ROS",
-  "timestamp": 1789702549.5314565,
-  "config_name": "warehouse_generated.yaml"
+  "config_path": "/workspace/Hunav_isaac_wrapper/src/scenarios/brownstone_agents.yaml",
+  "world": "brownstone",
+  "robot": "go2",
+  "timestamp": 1789889962.2450063,
+  "config_name": "brownstone_agents.yaml"
 }

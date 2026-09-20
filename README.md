@@ -50,7 +50,8 @@ It supports both **ROS 2 teleoperation** and **autonomous navigation (Nav2)**, w
   - Supports animation **retargeting**, applying a single set of animations to different characters via **USD SkelAnimation** and the **Omni Anim Retargeting extension**
 
 - **Multiple Robot Models:**  
-  - Includes `jetbot`, `create3`, `carter`, and `carter_ROS` models
+  - Wheeled: `jetbot`, `create3`, `carter`, and `carter_ROS`
+  - Legged: `go2` — Unitree Go2 quadruped, walking under a bundled flat-terrain locomotion policy
 
 - **ROS 2 Navigation (Nav2) Support:**  
   - Enables autonomous navigation for the **Carter** robot using the **ROS 2 Nav2** stack
@@ -188,7 +189,13 @@ Each world is paired with a YAML file in `src/scenarios/` that defines the HuNav
 #### 🤖 Robot Configuration
 
 The interactive launcher will prompt you to select your desired robot:
-- `jetbot`, `create3`, `carter`, or `carter_ROS`
+- `jetbot`, `create3`, `carter`, `carter_ROS`, or `go2`
+
+Robots are defined in one place, `src/hunav_isaac_wrapper/robots/specs.py`. Each entry
+says where its USD comes from, which driver moves it, how fast physics has to run for
+that driver, and what HuNavSim should be told about its size. Adding a robot means adding
+one `RobotSpec`; the CLI `--robot` choices and the interactive menu are both derived from
+that registry.
 
 **Note:** For `carter_ROS`, make sure to unzip the `nova_carter_ros2_sensors` package located in `src/config/robots/`. (The Docker entrypoint does this for you.)
 
@@ -198,6 +205,67 @@ which is backed by the USD bundled in this repository; selecting `carter` there 
 an explicit error rather than a 404.
 
 **Carter** robot also supports **ROS 2 Navigation (Nav2)** for autonomous navigation.
+
+**Note:** `go2` requires **Isaac Sim 6.0+**. It runs a TorchScript locomotion policy that
+maps a 48-element observation to 12 joint targets and takes its command as
+`(v_x, v_y, w_z)` — exactly a `Twist`. The robot USD streams from the usual asset bucket
+(`Isaac/IsaacLab/Robots/Unitree/Go2/go2.usd`); the policy is bundled in
+`src/config/policies/go2/` rather than streamed, for the reasons below. Three things to
+know:
+
+- **Physics runs at 200 Hz** for this robot, because that is the rate the policy was
+  trained at; below roughly 100 Hz the dog does not stand up. Rendering and the HuNavSim
+  crowd update stay at 20 Hz, so expect a lower frame rate than with a wheeled robot but
+  no change in crowd behaviour. The rate is `physics_dt` on the Go2's `RobotSpec` if you
+  need to trade gait quality for speed.
+- **Flat terrain only.** The policy is the flat-terrain variant; stairs and the
+  brownstone terraces are outside what it was trained on.
+- **`/cmd_vel` is clamped to ±1.0 m/s and ±1.0 rad/s**, the command range the policy was
+  trained over. `linear.y` is honoured — the Go2 can strafe, unlike the wheeled robots.
+
+The Go2 publishes `/odom`, `/tf` (`odom` → `base_link`) and `/joint_states` from Python.
+It has **no lidar or camera yet**, so there is no Nav2 parameter file for it; it is
+driven by teleop or by your own controller.
+
+##### Locomotion: why the Go2 does not use Isaac Sim's own policy
+
+Isaac Sim 6.0 ships a Go2 flat-terrain policy and
+`isaacsim.robot.policy.examples.robots.Go2FlatTerrainPolicy` loads it by
+default. On `6.0.1-rc.7` that policy stands but will not walk: any non-zero
+`/cmd_vel` makes the robot splay its legs and drag on its belly. It fails
+against all three shipped Go2 USDs, on CPU and GPU physics, with both actuator
+paths below, and at every command speed from 0.1 to 0.8 m/s. (The same
+extension's Spot policy collapses outright in the same harness.)
+
+So this package **ships its own policy**, trained with Isaac Lab against the
+same asset — see [`src/config/policies/go2/README.md`](src/config/policies/go2/README.md)
+for provenance and how to regenerate it. Two upstream mismatches are corrected
+along the way, and both are worth knowing if you extend this to another legged
+robot:
+
+- **Asset.** `go2.py` defaults to the Mujoco Menagerie conversion, which is the
+  *Newton* asset — `spot.py` in the same extension selects between a Newton and
+  a PhysX asset, and `go2.py` is missing that branch. The policy is trained
+  against `Isaac/IsaacLab/Robots/Unitree/Go2/go2.usd`, which is what
+  `asset_paths.py` resolves.
+- **Actuator.** `PolicyController` gives position targets to PhysX's implicit
+  joint drives. Isaac Lab trains against an explicit `DCMotor`: torque computed
+  in Python every physics step, applied as an effort, with a velocity-dependent
+  clamp that a symmetric effort limit does not reproduce. `RobotSpec` therefore
+  has an `actuation` field, and the Go2 sets it to `"explicit"`. With implicit
+  drives the robot collapses; with explicit torque it holds its stance.
+
+The integration is validated against Isaac Lab itself: running the same exported
+policy inside Isaac Lab's own `Isaac-Velocity-Flat-Unitree-Go2-Play-v0`
+environment reproduces the base height and velocity tracking this wrapper
+reports, to within a millimetre. If the Go2 ever walks oddly, that comparison is
+the way to tell a policy problem from an integration one.
+
+Measured with the shipped policy, commanding 0.5 m/s forward: the Go2 stands at
+0.345 m, walks at 0.326 m with an 8 mm body bob, and holds a steady-state
+body-frame velocity of 0.479 m/s — 96% of command. In the warehouse alongside a
+live HuNavSim crowd it covers 1.74 m in 4 s from a standing start while the
+agents walk normally around it.
 
 ### 6. Launch the Simulation
 

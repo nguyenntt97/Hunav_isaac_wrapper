@@ -4,3 +4,6 @@
 [submodule "third_party/crowdes"]
 	path = third_party/crowdes
 	url = https://github.com/InhwanBae/Crowd-Behavior-Generation
+[submodule "third_party/go2_omniverse"]
+	path = third_party/go2_omniverse
+	url = https://github.com/abizovnuralem/go2_omniverse

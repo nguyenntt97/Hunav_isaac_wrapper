@@ -421,9 +421,14 @@ class BehaviorAgentDriver:
         # densest geometry in the scene, and the geometry most likely to blow up
         # the baker -- is instanced.
         for prim in self.stage.TraverseAll():
+            if not prim.IsActive():
+                continue
+            path_str = prim.GetPath().pathString
+            if path_str.startswith(("/World/Go2", "/World/Nova_Carter", "/World/Carter", "/World/Jetbot", "/World/Create3")):
+                continue
             if not prim.IsA(UsdGeom.Mesh):
                 continue
-            if proxy_only and prim.GetPath().pathString.startswith(
+            if proxy_only and path_str.startswith(
                     FLAT_GROUND_PROXY_PATH):
                 # The proxy is authored invisible; the baker needs to see it.
                 UsdGeom.Imageable(prim).MakeVisible()

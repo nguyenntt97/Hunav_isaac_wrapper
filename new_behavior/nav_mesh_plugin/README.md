@@ -126,7 +126,7 @@ To solve all five blockers while delivering the **exact same feature set and use
 | Original `ov_navmesh` API | Original Implementation | Adapter Native Implementation |
 |---|---|---|
 | `NavmeshInterface(up_axis='Y')` | Custom coordinate flipper | Detects `UsdGeom.GetStageUpAxis(stage)`; handles stage units (m vs cm). |
-| `load_mesh(prim)` / `get_selected_prim()` | Scans selection, exports `.obj` | Creates or updates `NavMeshVolume` encompassing target bounds. |
+| `load_mesh(prim)` / `get_selected_prim()` | Scans selection, exports `.obj` | Records the selection and creates/updates a `NavMeshVolume` encompassing its bounds. The bake is then restricted to the selection by hiding every other mesh — see *Mesh assignment and what actually gets baked* below. |
 | `build_navmesh(settings={})` | Calls `PyRecast.build_navmesh` | Maps settings to carb settings and executes `inav.start_navmesh_baking_and_wait()`. |
 | `get_navmesh_polygons()` / `get_navmesh_triangles()` | Reads Detour polygon buffer | Queries native `navmesh.get_draw_triangles(area=0)` directly into numpy arrays. |
 | `get_navmesh_contours()` | Reads Detour raw edge list | Queries native `navmesh.get_draw_lines()` (paired edge vertices). |
@@ -138,6 +138,42 @@ To solve all five blockers while delivering the **exact same feature set and use
 | UI Window (`extension.py`) | Kit `ui.Window("Navmesh")` | Recreated Kit UI window with identical buttons, styling, and drop targets. |
 
 ---
+
+
+### Mesh assignment and what actually gets baked
+
+`ov_navmesh` fed the selected triangles straight into Recast, so only assigned
+geometry could ever become navmesh. `omni.anim.navigation.core` has no
+equivalent input: it voxelises **whatever is visible inside the
+`NavMeshVolume`**. Assignment therefore cannot restrict the bake by itself — it
+only sizes the volume.
+
+That difference produces a specific, confusing symptom. Assign three footpath
+meshes laid out in a triangle and the volume becomes their combined bounding
+box, which encloses the entire lawn between them (plus 4 m of padding in X/Y).
+The lawn's ground mesh is inside that box and is perfectly walkable, so it bakes
+too, and the result is a navmesh over the whole plane rather than over the three
+paths. Nothing failed; the assignment simply had no say in it.
+
+`build_navmesh(restrict_to_assigned=True)` (the default) closes the gap the only
+way the native baker allows: it hides every visible mesh outside the assignment,
+bakes, and restores visibility in a `finally`. This is the same lever
+`behavior_agent._hide_non_walkable()` already uses for the runtime bake, for a
+different reason (memory — brownstone's 1268 meshes exhaust CUDA otherwise).
+
+Measured on a 60 × 60 m ground slab with two 4 × 4 m platforms assigned:
+
+| | navmesh extent | verts on unassigned ground |
+| --- | --- | --- |
+| Before | X[-7, 7] Y[-4, 4] Z[0.00, 0.50] | 10749 |
+| After | X[-4.76, 4.76] Y[-1.76, 1.76] Z[0.50] | 0 |
+
+Two things to know:
+
+- Callers that never assign anything are unaffected — with no selection nothing
+  is hidden, so `build_and_visualize_navmesh()` and the runtime bake behave
+  exactly as before.
+- Pass `restrict_to_assigned=False` to get the old whole-volume behaviour.
 
 ## 5. Phase-by-Phase Implementation Roadmap
 

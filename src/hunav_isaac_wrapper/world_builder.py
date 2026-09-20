@@ -28,6 +28,12 @@ class WorldBuilder:
         if os.path.exists(map_path):
             self.usd_context.open_stage(map_path)
             print(f"Map '{map_name}' loaded from: {map_path}")
+            stage = self.get_stage()
+            if stage:
+                paint_tool = stage.GetPrimAtPath("/PaintTool")
+                if paint_tool and paint_tool.IsValid():
+                    paint_tool.SetActive(False)
+                    print("[WorldBuilder] Deactivated /PaintTool (corrupted point instancers)")
             return True
         print(f"[WorldBuilder] Error: map '{map_name}' not found at {map_path}")
         return False

@@ -230,11 +230,86 @@ class NavmeshInterface:
 
         return True
 
-    def build_navmesh(self, settings: Optional[Dict[str, Any]] = None) -> bool:
+    @staticmethod
+    def _pump(iterations: int = 6):
+        """Advance the app so pending visibility edits reach the baker.
+
+        Baking immediately after MakeInvisible() bakes the *old* visibility --
+        the same trap behavior_agent.bake_navmesh documents.
+        """
+        try:
+            import omni.kit.app
+
+            app = omni.kit.app.get_app()
+            for _ in range(iterations):
+                app.update()
+        except Exception:
+            pass
+
+    def _assigned_paths(self) -> List[str]:
+        """Prim paths currently assigned, as a flat list."""
+        if not self.input_prim:
+            return []
+        prims = self.input_prim if isinstance(self.input_prim, (list, tuple)) else [self.input_prim]
+        return [p.GetPath().pathString for p in prims if p and p.IsValid()]
+
+    def _hide_unassigned(self) -> List[Usd.Prim]:
+        """Hide every visible mesh outside the assignment. Returns what to restore.
+
+        omni.anim.navigation.core has no "bake only these meshes" input: it
+        voxelises whatever is visible inside the NavMeshVolume. Assigning a few
+        meshes only resizes that volume, so the ground they sit on -- and
+        anything else the volume happens to span -- bakes as walkable too.
+        Hiding the rest for the duration of the bake is how behavior_agent.py
+        already restricts its own bake, and it is the only lever the native
+        baker exposes.
+        """
+        keep = self._assigned_paths()
+        if not keep:
+            return []
+
+        hidden = []
+        # TraverseAll(), not Traverse(): the latter skips instancing prototypes,
+        # and instanced vegetation is exactly the geometry that pollutes a bake.
+        for prim in self.stage.TraverseAll():
+            if not prim.IsA(UsdGeom.Mesh):
+                continue
+            path = prim.GetPath().pathString
+            if any(path == k or path.startswith(k + "/") for k in keep):
+                continue
+            imageable = UsdGeom.Imageable(prim)
+            if imageable.ComputeVisibility() == UsdGeom.Tokens.invisible:
+                continue
+            imageable.MakeInvisible()
+            hidden.append(prim)
+        return hidden
+
+    @staticmethod
+    def _restore(hidden: List[Usd.Prim]):
+        for prim in hidden:
+            try:
+                UsdGeom.Imageable(prim).MakeVisible()
+            except Exception:
+                pass
+
+    def build_navmesh(
+        self,
+        settings: Optional[Dict[str, Any]] = None,
+        restrict_to_assigned: bool = True,
+    ) -> bool:
         """Configure parameters, suppress debug geometry, and trigger synchronous baking.
 
         Translates user-facing settings (given in meters, matching original ov_navmesh)
         into centimetres as required by omni.anim.navigation.core's carb settings.
+
+        Args:
+            settings: Recast-style overrides, in metres.
+            restrict_to_assigned: Bake only the meshes passed to
+                ``get_selected_prim``/``load_mesh``. The native baker has no
+                such input, so this is implemented by hiding everything else
+                for the duration of the bake. Pass False to bake the whole
+                volume, which is what this did before and what the runtime
+                bake in behavior_agent.py wants.
         """
         if not self.inav:
             if nav:
@@ -275,9 +350,22 @@ class NavmeshInterface:
         # Ensure volume exists if not already present
         self.ensure_navmesh_volume()
 
-        # Trigger bake
+        # Trigger bake. When meshes have been assigned, restrict the bake to
+        # them -- otherwise the volume's whole interior bakes as walkable.
         print(f"[NavMeshAdapter] Baking NavMesh (sampling={cell_size_cm:.1f}cm, height={agent_height_cm:.1f}cm, radius={agent_radius_cm:.1f}cm)...")
-        success = self.inav.start_navmesh_baking_and_wait()
+        hidden = []
+        if restrict_to_assigned:
+            hidden = self._hide_unassigned()
+            if hidden:
+                print(f"[NavMeshAdapter] Restricting bake to {len(self._assigned_paths())} "
+                      f"assigned mesh(es); {len(hidden)} other mesh(es) hidden.")
+                self._pump()
+        try:
+            success = self.inav.start_navmesh_baking_and_wait()
+        finally:
+            if hidden:
+                self._restore(hidden)
+                self._pump(2)
 
         self._navmesh = self.inav.get_navmesh()
         self.built = (self._navmesh is not None)

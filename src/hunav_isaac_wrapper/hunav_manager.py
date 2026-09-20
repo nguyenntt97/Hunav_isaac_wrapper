@@ -68,15 +68,24 @@ class HuNavManager:
         robot,
         terrain_follow=False,
         step_height=0.25,
+        robot_spec=None,
     ):
         self.node = node
         self.stage = world.stage
-        # Physics/render step, matching TeleopHuNavSim's World(). Used to
+        # Rendering step, matching TeleopHuNavSim's World(). Used to
         # finite-difference agent velocity, which the behavior API does not
         # report (get_linear_velocity() returns zero for a walking agent).
+        #
+        # Note this is the *rendering* rate, not necessarily the physics rate:
+        # a robot whose controller needs faster physics (the Go2 policy runs at
+        # 200 Hz) does not change how often agents are updated. TeleopHuNavSim
+        # decimates its physics callback to keep that true.
         self.dt = 1.0 / 20.0
         self.robot_prim_path = robot_prim_path
         self.robot_obj = robot
+        # Describes the robot HuNavSim is told about. None keeps the historical
+        # one-size-fits-all values.
+        self.robot_spec = robot_spec
         self.world = world
         self.config_file_path = config_file_path
 
@@ -750,7 +759,9 @@ class HuNavManager:
         self._call_compute(agents_msg, robot_msg)
 
     def _create_robot_msg(self):
-        # Retrieve robot pose and velocities from the WheeledRobot object
+        # Retrieve robot pose and velocities from the robot driver. Every driver
+        # returns the same shapes as the WheeledRobot this used to be handed:
+        # xyz position, wxyz orientation, and world-frame velocities.
         pos, quat = self.robot_obj.get_world_pose()
         lin_vel = self.robot_obj.get_linear_velocity()
         ang_vel = self.robot_obj.get_angular_velocity()
@@ -761,8 +772,14 @@ class HuNavManager:
         robot.skin = 1
         robot.name = "Robot"
         robot.group_id = 0
-        robot.radius = 0.5
-        robot.desired_velocity = 1.0
+        # Sized from the robot's own spec where there is one; a Go2 is not the
+        # same 0.5 m disc as a Nova Carter.
+        robot.radius = 0.5 if self.robot_spec is None else self.robot_spec.hunav_radius
+        robot.desired_velocity = (
+            1.0
+            if self.robot_spec is None
+            else self.robot_spec.hunav_desired_velocity
+        )
         # float() is mandatory, not cosmetic: rosidl's generated C asserts
         # PyFloat_Check on these fields, and get_linear_velocity()/
         # get_angular_velocity() return backend-dependent scalars (numpy or

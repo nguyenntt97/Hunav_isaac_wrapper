@@ -8,7 +8,7 @@ This script provides a command-line interface that allows users to:
 - Select between existing agent configuration files or create new ones via RViz
 - Choose from built-in presets (warehouse, hospital, office) or custom YAML files
 - Automatically infer the simulation world based on the configuration file
-- Select the robot type (jetbot, create3, carter, carter_ROS)
+- Select the robot type (see hunav_isaac_wrapper.robots for the registry)
 - Launch the TeleopHuNavSim node with the selected parameters
 
 """
@@ -32,6 +32,15 @@ if os.path.exists(workspace_root) and workspace_root not in sys.path:
     sys.path.insert(0, workspace_root)
 
 import rclpy
+
+# The robot registry is deliberately importable without Isaac Sim: it pulls in
+# nothing heavier than numpy, so the launcher can build its menus before
+# deciding whether to boot the simulator at all.
+from hunav_isaac_wrapper.robots import (
+    DEFAULT_ROBOT,
+    robot_descriptions,
+    robot_names,
+)
 
 TeleopHuNavSim = None  # Import Isaac Sim components only when needed to avoid startup issues
 
@@ -135,7 +144,9 @@ LAST_CONFIG_FILE = os.path.join(CONFIG_CONFIG_DIR, "last_launch_config.json")
 # built-in presets
 PRESETS = {"warehouse_agents", "hospital_agents", "office_agents", "brownstone_agents"}
 KNOWN_WORLDS = {"warehouse", "hospital", "office", "empty_world", "brownstone"}
-ROBOTS = ["jetbot", "create3", "carter", "carter_ROS"]
+# Derived from the one robot registry rather than restated here, so adding a
+# robot cannot leave the CLI and the simulator disagreeing about what exists.
+ROBOTS = robot_names()
 
 # Colors for terminal output
 class Colors:
@@ -354,6 +365,7 @@ Examples:
   {sys.argv[0]} --list-configs           # List available configurations
   {sys.argv[0]} --config agents_warehouse --robot carter
   {sys.argv[0]} --config custom_config.yaml --world office --robot jetbot
+  {sys.argv[0]} --config warehouse_agents.yaml --robot go2
   {sys.argv[0]} --batch                  # Non-interactive mode with defaults
 
 Configuration files are searched in: {CONFIG_DIR}
@@ -535,21 +547,15 @@ def main():
         if args.verbose:
             print_info(f"Using robot from last configuration: {robot}")
     elif args.batch:
-        robot = ROBOTS[3]  # Default to carter_ROS
+        robot = DEFAULT_ROBOT
         print_info(f"Batch mode: using default robot {robot}")
     else:
         # Interactive robot selection
-        robot_descriptions = {
-            "jetbot": "Small differential drive robot for basic navigation",
-            "create3": "iRobot Create3 educational robot platform", 
-            "carter": "NVIDIA Carter robot for advanced navigation",
-            "carter_ROS": "Carter with full ROS2 Nav2 stack support"
-        }
         robot = choose(
             "Select robot:",
             ROBOTS,
-            default=ROBOTS[3],
-            show_descriptions=robot_descriptions
+            default=DEFAULT_ROBOT,
+            show_descriptions=robot_descriptions()
         )
     
     # Final summary

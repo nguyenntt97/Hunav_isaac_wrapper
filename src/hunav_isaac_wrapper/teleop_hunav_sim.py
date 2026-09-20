@@ -48,6 +48,11 @@ LIVESTREAM = _env_flag("LIVESTREAM") or _os.environ.get(
 #                              by the carter_ROS robot's built-in graph
 #   isaacsim.sensors.physics - IsaacReadIMU, referenced by the carter_ROS USD
 #   omni.physx.bundle        - full PhysX suite (scene query, vehicle, etc.)
+#   isaacsim.robot.policy.examples
+#                            - Go2FlatTerrainPolicy and the PolicyController it
+#                              derives from. Extension python modules are only
+#                              importable while the extension is enabled, and
+#                              the Go2 driver imports it at construction time.
 #
 # omni.anim.graph.core and omni.anim.retarget.core used to be here for the
 # AnimationGraph path. That path is gone: see behavior_agent.py.
@@ -61,6 +66,7 @@ STARTUP_EXTENSIONS = [
     "isaacsim.ros2.bridge",
     "isaacsim.sensors.physics",
     "omni.physx.bundle",
+    "isaacsim.robot.policy.examples",
 ]
 
 _ENABLE_ARGS = []
@@ -128,10 +134,6 @@ from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from isaacsim.core.api import World
 from isaacsim.storage.native import get_assets_root_path
-from isaacsim.robot.wheeled_robots.robots import WheeledRobot
-from isaacsim.robot.wheeled_robots.controllers.differential_controller import (
-    DifferentialController,
-)
 import omni
 import omni.graph.core as og
  
@@ -140,11 +142,9 @@ from .world_builder import WorldBuilder
 from .hunav_manager import HuNavManager
 from .behavior_agent import BehaviorAgentDriver
 from .terrain import apply_flat_ground
-from .asset_paths import (
-    get_isaac_major,
-    is_robot_available,
-    robot_usd_relative_path,
-)
+from .asset_paths import get_isaac_major
+from .robots import RENDER_DT, get_spec, make_driver, require_available
+from .robots.ros_publishers import RobotStatePublisher
 
 # Default maximum step an agent can climb when --terrain-follow is on, in metres.
 # 0.25 m is about a kerb: on the brownstone terraces (mean 0.43 m, max 0.94 m)
@@ -158,90 +158,23 @@ DEFAULT_STEP_HEIGHT = 0.25
 # colliders. PhysX resolves that degenerate contact by launching the robot
 # (measured: ejected at ~23 m/s, 115 m away within 5 s). Anywhere else on the
 # park's path network is stable, so brownstone spawns off-origin instead.
+#
+# The z here is the world's own ground clearance. A robot that needs to be
+# dropped in from higher up -- a quadruped has to fall into its stance rather
+# than start in it -- adds RobotSpec.spawn_z_offset on top, so the per-world
+# entries stay valid for every robot.
 DEFAULT_ROBOT_SPAWN = [0.0, 0.0, 0.0]
 ROBOT_SPAWN_POSE = {
     "brownstone": [4.0, -43.0, 0.25],
 }
 
 
-def find_package_share_directory():
-    """
-    Find the package share directory containing worlds, scenarios, config, etc.
-    Works both in development and installed package modes.
-    """
-    # Try to find via ROS2 package first (installed mode)
-    try:
-        result = subprocess.run(
-            ["ros2", "pkg", "prefix", "hunav_isaac_wrapper"],
-            capture_output=True, text=True, check=True
-        )
-        pkg_path = Path(result.stdout.strip())
-        share_dir = pkg_path / "share" / "hunav_isaac_wrapper"
-        if share_dir.exists() and (share_dir / "worlds").exists():
-            return str(share_dir)
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        pass
-    
-    # Development mode fallback
-    current_file = Path(__file__)
-    
-    # Check if we're in src/hunav_isaac_wrapper/ (development mode)
-    if current_file.parent.parent.name == "src":
-        src_dir = current_file.parent.parent
-        if (src_dir / "worlds").exists():
-            return str(src_dir)
-    
-    # Last fallback - check current working directory
-    cwd = Path.cwd()
-    if (cwd / "worlds").exists():
-        return str(cwd)
-    
-    # If all else fails, return the old path calculation
-    return os.path.dirname(os.path.dirname(__file__))
+from .package_paths import (
+    find_config_path,
+    find_package_share_directory,
+    find_robot_config_path,
+)
 
-
-def find_robot_config_path(filename):
-    """
-    Find robot configuration file in development or installed package.
-    
-    Args:
-        filename: Name of the robot config file (e.g., "nova_carter_ros2_sensors.usd")
-    
-    Returns:
-        str: Absolute path to the robot config file
-    """
-    # Try to find via ROS2 package share directory (installed mode)
-    try:
-        result = subprocess.run(
-            ["ros2", "pkg", "prefix", "hunav_isaac_wrapper"],
-            capture_output=True, text=True, check=True
-        )
-        pkg_path = Path(result.stdout.strip())
-        robot_config = pkg_path / "share" / "hunav_isaac_wrapper" / "config" / "robots" / filename
-        if robot_config.exists():
-            return str(robot_config)
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        pass
-    
-    # Try development mode (relative to this file)
-    current_file_dir = Path(__file__).parent
-    workspace_root = current_file_dir.parent.parent
-    robot_config = workspace_root / "config" / "robots" / filename
-    if robot_config.exists():
-        return str(robot_config)
-    
-    # Try alternative development paths
-    dev_paths = [
-        current_file_dir.parent / "config" / "robots" / filename,
-        Path.cwd() / "src" / "config" / "robots" / filename,
-        Path.cwd() / "config" / "robots" / filename,
-    ]
-    
-    for path in dev_paths:
-        if path.exists():
-            return str(path)
-    
-    raise FileNotFoundError(f"Robot config file not found: {filename}")
 
 class TeleopHuNavSim(Node):
     """
@@ -281,6 +214,8 @@ class TeleopHuNavSim(Node):
         self.hunav = None
         self.robot = None
         self.driver = None
+        self.robot_spec = None
+        self.state_publisher = None
         self.scenario_manager = None
         self._navmesh_window = None
 
@@ -326,11 +261,33 @@ class TeleopHuNavSim(Node):
         if self.flat_ground and map_loaded:
             apply_flat_ground(self.builder.get_stage(), map_name)
 
+        # The robot decides how fast physics has to run. A differential drive is
+        # happy at the rendering rate; a learned locomotion policy is a closed
+        # loop that has to be stepped at the rate it was trained at (200 Hz for
+        # the Go2) or the robot never stands up. Rendering stays at 20 Hz either
+        # way, so world.step() simply substeps physics when the two differ.
+        #
+        # Authoring mode never spawns a robot, so it takes the historical rate.
+        self.robot_spec = None if self.author_mode else get_spec(robot_name)
+        physics_dt = RENDER_DT if self.robot_spec is None else self.robot_spec.physics_dt
+        backend = "numpy" if self.robot_spec is None else self.robot_spec.backend
+        device = None if self.robot_spec is None else self.robot_spec.device
+
         # Create World object
-        timestep = 1.0 / 20.0
         self.world = World(
-            stage_units_in_meters=1, physics_dt=timestep, rendering_dt=timestep
+            stage_units_in_meters=1,
+            physics_dt=physics_dt,
+            rendering_dt=RENDER_DT,
+            backend=backend,
+            device=device,
         )
+
+        # send_agents_msg() blocks on a HuNavSim service round-trip and
+        # HuNavManager differences agent poses against a hardcoded 1/20 s. Both
+        # break if the PhysX callback that drives them starts firing at 200 Hz,
+        # so the crowd tick is decimated back to the rendering rate.
+        self._hunav_decimation = max(1, int(round(RENDER_DT / physics_dt)))
+        self._physics_step_count = 0
 
         if map_name == "empty_world":
             self.world.scene.add_default_ground_plane()
@@ -343,92 +300,63 @@ class TeleopHuNavSim(Node):
             self._build_authoring(map_name)
             return
 
-        # Define configuration for each wheeled robot available. The USD paths of
-        # the built-in robots moved in Isaac Sim 5.0, so they are resolved through
-        # asset_paths rather than hardcoded; carter_ROS uses the bundled asset.
+        spec = self.robot_spec
         isaac_major = get_isaac_major()
-        robot_configs = {
-            "jetbot": {
-                "name": "Jetbot",
-                "usd_relative_path": robot_usd_relative_path("jetbot", isaac_major),
-                "wheel_dof_names": ["left_wheel_joint", "right_wheel_joint"],
-                "wheel_radius": 0.0325,
-                "wheel_base": 0.118,
-            },
-            "create3": {
-                "name": "Create3",
-                "usd_relative_path": robot_usd_relative_path("create3", isaac_major),
-                "wheel_dof_names": ["left_wheel_joint", "right_wheel_joint"],
-                "wheel_radius": 0.03575,
-                "wheel_base": 0.233,
-            },
-            "carter": {
-                "name": "Nova_Carter",
-                "usd_relative_path": robot_usd_relative_path("carter", isaac_major),
-                "wheel_dof_names": ["joint_wheel_left", "joint_wheel_right"],
-                "wheel_radius": 0.14,
-                "wheel_base": 0.413,
-            },
-            "carter_ROS": {
-                "name": "Nova_Carter",
-                "usd_relative_path": find_robot_config_path("nova_carter_ros2_sensors.usd"),
-                "wheel_dof_names": ["joint_wheel_left", "joint_wheel_right"],
-                "wheel_radius": 0.14,
-                "wheel_base": 0.413,
-            },
-        }
+        require_available(spec, isaac_major)
 
-        if robot_name not in robot_configs:
-            raise ValueError(f"Unsupported robot_name: {robot_name}")
+        # Only the selected robot's USD is resolved. The old code built every
+        # robot's path while constructing a dict literal, so a still-zipped
+        # Carter asset made --robot jetbot fail too.
+        robot_path = spec.usd_path(
+            assets_root_path, find_robot_config_path, isaac_major
+        )
+        spec = spec.with_resolved_policy(find_config_path)
+        self.robot_spec = spec
 
-        if not is_robot_available(robot_name, isaac_major):
-            raise ValueError(
-                f"Robot '{robot_name}' has no asset in Isaac Sim {isaac_major}.x. "
-                "Use 'carter_ROS', which ships with this package."
-            )
+        world_spawn = ROBOT_SPAWN_POSE.get(map_name, DEFAULT_ROBOT_SPAWN)
+        self.robot_spawn_pose = [
+            world_spawn[0],
+            world_spawn[1],
+            world_spawn[2] + spec.spawn_z_offset,
+        ]
 
-        robot_config = robot_configs[robot_name]
-        
-        # Handle absolute vs relative paths for robot USD files
-        if os.path.isabs(robot_config["usd_relative_path"]):
-            # Absolute path (for custom robots like carter_ROS)
-            robot_path = robot_config["usd_relative_path"]
-        else:
-            # Relative path (for built-in Isaac Sim robots)
-            robot_path = os.path.join(assets_root_path, robot_config["usd_relative_path"])
+        # A learned gait is trained against a specific ground friction (1.0 /
+        # 1.0 for the Go2); on a slicker floor the feet skate and the policy
+        # degrades. Wheeled robots keep whatever the stage authored.
+        if spec.driver == "go2_policy":
+            from .robots.ground import apply_ground_friction
 
-        # Add robot to world
-        robot_prim_path = f"/World/{robot_config['name']}"
-        self.robot_spawn_pose = ROBOT_SPAWN_POSE.get(map_name, DEFAULT_ROBOT_SPAWN)
+            try:
+                apply_ground_friction(self.builder.get_stage())
+            except Exception as exc:
+                print(f"[hunav] Could not set ground friction: {exc}", flush=True)
+
+        robot_prim_path = f"/World/{spec.prim_name}"
         # Logged because a robot that is "missing" is nearly always one that was
         # spawned somewhere else (a stale session using an older spawn table) or
         # one that PhysX ejected on the first step -- see _warn_if_robot_moved.
         print(
-            f"[hunav] Robot '{robot_config['name']}' spawning at "
+            f"[hunav] Robot '{spec.prim_name}' spawning at "
             f"{self.robot_spawn_pose} (world key: '{map_name}'"
-            f"{'' if map_name in ROBOT_SPAWN_POSE else ' -> default'})"
+            f"{'' if map_name in ROBOT_SPAWN_POSE else ' -> default'}), "
+            f"physics at {1.0 / spec.physics_dt:.0f} Hz"
         )
-        self.robot = self.world.scene.add(
-            WheeledRobot(
-                prim_path=robot_prim_path,
-                name="Robot",
-                wheel_dof_names=robot_config["wheel_dof_names"],
-                create_robot=True,
-                usd_path=robot_path,
-                position=self.robot_spawn_pose,
-                orientation=[0, 0, 0, 1],
-            )
+        self.driver = make_driver(
+            spec, self.world, robot_path, self.robot_spawn_pose
         )
+        # HuNavManager only ever calls get_world_pose/get_linear_velocity/
+        # get_angular_velocity on this, which every driver implements.
+        self.robot = self.driver
 
-        # Create differential drive controller
-        self.diff_controller = DifferentialController(
-            name="diff_drive_controller",
-            wheel_radius=robot_config["wheel_radius"],
-            wheel_base=robot_config["wheel_base"],
+        # Robots whose USD ships its own publisher graph (carter_ROS) must not
+        # get a second one.
+        self.state_publisher = (
+            RobotStatePublisher(self, self.driver) if spec.publish_odom_tf else None
         )
 
         # ROS2 cmd_vel subscriber
         self.cmd_lin = 0.00
+        self.cmd_lin_y = 0.00
         self.cmd_ang = 0.00
         self.cmd_vel_sub = self.create_subscription(
             Twist, "/cmd_vel", self._cmd_vel_callback, 10
@@ -443,6 +371,7 @@ class TeleopHuNavSim(Node):
             robot=self.robot,
             terrain_follow=self.terrain_follow,
             step_height=self.step_height,
+            robot_spec=spec,
         )
 
         self.create_ros_clock_action_graph()
@@ -603,14 +532,28 @@ class TeleopHuNavSim(Node):
         os._exit(130)
 
     def _cmd_vel_callback(self, msg):
+        # linear.y is carried through for robots that can strafe; the
+        # differential drivers ignore it, and Nav2's controllers never set it.
         self.cmd_lin = msg.linear.x
+        self.cmd_lin_y = msg.linear.y
         self.cmd_ang = msg.angular.z
+        if self.driver is not None:
+            self.driver.set_command(self.cmd_lin, self.cmd_lin_y, self.cmd_ang)
 
     def _on_physics_step(self, dt: float):
         """
         Called automatically by PhysX each physics frame.
+
+        Control that closes a loop around joint state runs every step, at the
+        physics rate. The crowd update does not: it blocks on a HuNavSim
+        service call and assumes a 20 Hz cadence, so it is decimated back to
+        that regardless of how fast physics is running.
         """
-        self.hunav.send_agents_msg()
+        self.driver.on_physics_step(dt)
+
+        self._physics_step_count += 1
+        if self._physics_step_count % self._hunav_decimation == 0:
+            self.hunav.send_agents_msg()
 
     def create_ros_clock_action_graph(self, graph_path="/World/ROS2"):
         try:
@@ -740,5 +683,10 @@ class TeleopHuNavSim(Node):
                     self.hunav.report_locomotion_health()
                 except Exception as exc:
                     print(f"[hunav] locomotion check errored: {exc}", flush=True)
-            wheel_action = self.diff_controller.forward([self.cmd_lin, self.cmd_ang])
-            self.robot.apply_wheel_actions(wheel_action)
+            self.driver.on_render_step()
+            if self.state_publisher is not None:
+                self.state_publisher.publish()
+            # The node used to be spun only as a side effect of HuNavManager's
+            # blocking service call, which made teleop depend on HuNavSim being
+            # alive. Spin it here so /cmd_vel is serviced on its own.
+            rclpy.spin_once(self, timeout_sec=0.0)

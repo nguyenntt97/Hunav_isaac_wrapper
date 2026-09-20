@@ -35,6 +35,20 @@ _ROBOT_USD = {
         4: os.path.join("Isaac", "Robots", "Carter", "nova_carter_sensors.usd"),
         5: None,
     },
+    # The Isaac Lab Go2, which is the asset the locomotion policy is trained
+    # against (env.yaml names it as scene.robot.spawn.usd_path). Isaac Sim's own
+    # Go2FlatTerrainPolicy defaults to the Mujoco Menagerie conversion instead --
+    # that asset is meant for the Newton engine, the way spot.py selects between
+    # the two, and go2.py is missing that branch.
+    #
+    # The explicit Nones for 4 and 5 are load-bearing: _lookup falls back to the
+    # lowest key when nothing matches, so without them a 5.x install would be
+    # handed a path that 404s instead of the "no asset in this release" error.
+    "go2": {
+        4: None,
+        5: None,
+        6: os.path.join("Isaac", "IsaacLab", "Robots", "Unitree", "Go2", "go2.usd"),
+    },
 }
 
 
