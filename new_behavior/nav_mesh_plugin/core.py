@@ -349,6 +349,120 @@ class NavmeshInterface:
         """Prim paths of the meshes the assignment resolved to."""
         return [p.GetPath().pathString for p in self.input_meshes if p and p.IsValid()]
 
+    # The settings that actually reach the native baker. The rest of
+    # DEFAULT_RECAST_SETTINGS is ov_navmesh compatibility padding that
+    # _configure_bake drops, and recording it would make a scenario file look
+    # like it controls things it does not.
+    RECORDED_SETTINGS = (
+        "cellSize", "agentHeight", "agentRadius", "agentMinRadius",
+        "agentMaxClimb", "agentMaxSlope", "agentMinIslandRadius",
+        "excludeRigidBodies", "useGpu",
+    )
+
+    def _find_volume(self) -> Optional[Usd.Prim]:
+        """The NavMeshVolume already on stage, without creating one."""
+        if not self.stage:
+            return None
+        for prim in self.stage.TraverseAll():
+            if prim.GetTypeName() == "NavMeshVolume":
+                return prim
+        return None
+
+    def navmesh_volume_box(self) -> Optional[Tuple[Tuple[float, float, float],
+                                                   Tuple[float, float, float]]]:
+        """The volume's world box as ((min), (max)), or None.
+
+        This is the box the baker actually saw -- padding included -- not the
+        bounds of the assignment ensure_navmesh_volume derived it from. A run
+        reproducing this bake has to apply it verbatim; handing the assignment
+        bounds back to ensure_navmesh_volume would pad an already padded box and
+        bake a wider mesh than the one that was designed.
+        """
+        volume = self._find_volume()
+        if volume is None:
+            return None
+        translate = volume.GetAttribute("xformOp:translate")
+        scale = volume.GetAttribute("xformOp:scale")
+        if not (translate and translate.IsValid() and scale and scale.IsValid()):
+            return None
+        centre, size = translate.Get(), scale.Get()
+        if centre is None or size is None:
+            return None
+        # scale is the volume's FULL size: the command authors an extent of
+        # +/-0.5, so halving it is what turns a scale into a box.
+        half = [float(v) * 0.5 for v in size]
+        mid = [float(v) for v in centre]
+        return (
+            tuple(mid[i] - half[i] for i in range(3)),
+            tuple(mid[i] + half[i] for i in range(3)),
+        )
+
+    def set_navmesh_volume_box(self, vmin, vmax) -> bool:
+        """Put the volume exactly on this box, with no padding of our own."""
+        volume = self.ensure_navmesh_volume()
+        if volume is None:
+            return False
+        centre = Gf.Vec3d(*[(float(a) + float(b)) * 0.5 for a, b in zip(vmin, vmax)])
+        scale = Gf.Vec3f(*[max(float(b) - float(a), 1e-3) for a, b in zip(vmin, vmax)])
+        for name, value in (("xformOp:translate", centre), ("xformOp:scale", scale)):
+            attr = volume.GetAttribute(name)
+            if attr and attr.IsValid():
+                attr.Set(value)
+        return True
+
+    def assign_paths(self, paths: List[str]) -> int:
+        """Re-establish an assignment from recorded prim paths.
+
+        The resolution `get_selected_prim` does, driven by paths instead of the
+        live selection, so a run can restrict its bake to what an authoring
+        session assigned. Returns how many meshes resolved -- compare it against
+        what the scenario recorded before trusting the bake.
+        """
+        if not self.stage:
+            self.stage = omni.usd.get_context().get_stage()
+
+        prims, missing = [], []
+        for path in paths:
+            prim = self.stage.GetPrimAtPath(path)
+            if prim and prim.IsValid():
+                prims.append(prim)
+            else:
+                missing.append(path)
+        if missing:
+            print(
+                f"[NavMeshAdapter] Warning: {len(missing)} assigned prim path(s) are "
+                f"not on this stage ({', '.join(missing[:3])}"
+                f"{' ...' if len(missing) > 3 else ''}); they cannot be baked."
+            )
+
+        self.input_prim = prims
+        self.input_meshes = usd_utils.find_stage_meshes(self.stage, prims) if prims else []
+        return len(self.input_meshes)
+
+    def describe_bake(self) -> Dict[str, Any]:
+        """What this bake was, in the form a scenario file records.
+
+        Read back after the bake rather than taken from the caller's arguments:
+        the defaults `_configure_bake` merges in are as much a part of the bake
+        as the overrides, and a scenario that records only the overrides cannot
+        reproduce it once those defaults change.
+        """
+        roots = self.input_prim
+        if roots is None:
+            roots = []
+        elif isinstance(roots, Usd.Prim):
+            roots = [roots]
+
+        box = self.navmesh_volume_box()
+        return {
+            "assigned_prims": [p.GetPath().pathString for p in roots if p and p.IsValid()],
+            "assigned_mesh_count": len(self.input_meshes),
+            "bake_settings": {k: self.settings.get(k)
+                              for k in self.RECORDED_SETTINGS if k in self.settings},
+            "volume_min": box[0] if box else None,
+            "volume_max": box[1] if box else None,
+        }
+
     def _keep_set(self) -> Tuple[set, set]:
         """Paths to keep visible during a restricted bake.
 
@@ -627,6 +741,7 @@ class NavmeshInterface:
         settings: Optional[Dict[str, Any]] = None,
         restrict_to_assigned: bool = True,
         fix_inverted: bool = True,
+        settle_frames: int = 6,
     ) -> bool:
         """Configure parameters, suppress debug geometry, and trigger synchronous baking.
 
@@ -645,6 +760,12 @@ class NavmeshInterface:
                 wound inside-out, which the baker would otherwise read as a
                 ceiling and skip in silence. Session-layer only; the asset is
                 never modified. Pass False to bake exactly what the scene says.
+            settle_frames: Frames to pump before baking, so the hide reaches the
+                baker. Six is enough for an authoring session, where the stage is
+                already drawn; a run bakes during start-up with a thousand-odd
+                meshes changing visibility at once, and baking too early there
+                bakes the *old* visibility -- the full scene -- which is exactly
+                the trap behavior_agent.bake_navmesh documents at 250 frames.
         """
         if not self._acquire():
             return False
@@ -652,7 +773,7 @@ class NavmeshInterface:
         hidden = self._begin_restriction(restrict_to_assigned)
         flipped = self._flip_inverted() if fix_inverted else []
         if hidden or flipped:
-            self._pump()
+            self._pump(settle_frames)
         try:
             self.inav.start_navmesh_baking_and_wait()
         finally:
@@ -660,7 +781,7 @@ class NavmeshInterface:
             if hidden:
                 self._restore(hidden)
             if hidden or flipped:
-                self._pump(2)
+                self._pump(max(2, settle_frames // 4))
         return self._conclude_bake()
 
     async def build_navmesh_async(

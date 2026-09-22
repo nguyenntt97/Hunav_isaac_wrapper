@@ -459,7 +459,10 @@ class TeleopHuNavSim(Node):
             f"digest {provenance.settings_digest}\n"
             f"        Scenarios: {scenario_paths.scenarios_dir()}\n"
             f"        Trees:     {scenario_paths.behavior_trees_dir()}\n"
-            "        Use the Navmesh window's 'Agent Spawns & Goals' section.\n"
+            "        The bake above covers the whole map. To design the navmesh,\n"
+            "        select the walkable meshes in the stage tree, press Assign\n"
+            "        Mesh, then Build Navmesh -- that bake is recorded and is what\n"
+            "        the run reproduces. Then use 'Agent Spawns & Goals'.\n"
             "        Export writes the YAML and one behavior tree per agent;\n"
             "        relaunch without --author-scenario to run what you wrote.\n",
             flush=True,

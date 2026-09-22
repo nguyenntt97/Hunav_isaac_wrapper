@@ -588,6 +588,90 @@ class BehaviorAgentDriver:
         if proxy and proxy.IsValid():
             UsdGeom.Imageable(proxy).MakeInvisible()
 
+    def bake_authored_navmesh(self, provenance):
+        """Reproduce the navmesh an authoring session designed.
+
+        ``provenance`` is a NavmeshProvenance carrying an assignment: the prims
+        the author picked in the navmesh helper, the volume that bake used and
+        the settings it ran with.
+
+        The native baker has no "bake only these meshes" input -- it voxelises
+        whatever is visible inside the volume -- so an assignment is reproduced
+        only by restoring the same volume, the same settings and the same
+        visibility. That is precisely what the helper's own bake does, so this
+        calls it rather than reimplementing it: a second implementation would
+        drift from the first, and the symptom would be a navmesh that differs
+        from the authored one in ways nothing reports.
+
+        Returns True when the authored mesh baked. False means the caller must
+        fall back to deriving its own bake, which produces a *different* mesh --
+        one the scenario's spawns and goals were never validated against.
+        """
+        from .nav_mesh_plugin.core import NavmeshInterface
+
+        adapter = NavmeshInterface(stage=self.stage)
+        resolved = adapter.assign_paths(list(provenance.assigned_prims))
+        if not resolved:
+            print(
+                "[behavior] the scenario's assigned navmesh prims resolved to no "
+                "mesh on this stage; the authored navmesh cannot be reproduced."
+            )
+            return False
+
+        expected = int(provenance.assigned_mesh_count or 0)
+        if expected and resolved != expected:
+            print(
+                f"[behavior] WARNING: the assignment resolved to {resolved} mesh(es) "
+                f"but {expected} were assigned when the scenario was authored. The "
+                "usual cause is launching with different world flags than the "
+                "authoring session used -- --flat-ground hides raised meshes, and "
+                "a hidden mesh is not baked."
+            )
+
+        settings = dict(provenance.bake_settings or {})
+        override = _navmesh_overrides().get("agentSamplingDistance")
+        if override is not None:
+            # The tuning knob still wins when it is set explicitly -- it exists
+            # for frame-rate work -- but it stops this being the authored mesh,
+            # and coarsening drops narrow walkable strips out of the bake, so it
+            # cannot pass silently. NAVMESH_SETTINGS is in centimetres and the
+            # helper's cellSize is in metres.
+            settings["cellSize"] = float(override) / 100.0
+            print(
+                f"[behavior] WARNING: HUNAV_NAVMESH_AGENTSAMPLINGDISTANCE={override} "
+                "overrides the authored sampling distance. This run is no longer "
+                "on the navmesh the scenario was authored against; unset it to "
+                "bake the designed mesh."
+            )
+
+        adapter.set_navmesh_volume_box(provenance.volume_min, provenance.volume_max)
+        size = tuple(float(hi) - float(lo)
+                     for lo, hi in zip(provenance.volume_min, provenance.volume_max))
+
+        # 250 frames to settle, not the helper's 6: a run changes the visibility
+        # of every mesh in the world at once during start-up, and baking before
+        # that reaches the baker bakes the full scene instead of the assignment.
+        if not adapter.build_navmesh(settings=settings, restrict_to_assigned=True,
+                                     settle_frames=250):
+            print(
+                "[behavior] the authored navmesh bake produced nothing. Note that a "
+                "failed bake poisons every later bake in this process, so a fallback "
+                "is unlikely to succeed either -- fix the scenario's assignment "
+                "rather than reading the next bake as healthy."
+            )
+            return False
+
+        self._navmesh_baked = True
+        self.navmesh_extent = size
+        cell = float(settings.get("cellSize") or 0.0)
+        self.navmesh_sampling = cell * 100.0 if cell < 15.0 else cell
+        print(
+            f"[behavior] authored navmesh baked: {resolved} assigned mesh(es) at "
+            f"{self.navmesh_sampling:.1f} cm sampling, volume "
+            f"{size[0]:.1f} x {size[1]:.1f} x {size[2]:.1f} m"
+        )
+        return True
+
     def bake_navmesh(self, extent=None, ground_z=None):
         """Bake the navmesh and block until it is done.
 

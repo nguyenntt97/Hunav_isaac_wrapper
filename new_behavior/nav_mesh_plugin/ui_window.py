@@ -170,6 +170,16 @@ class NavmeshWindow:
                         self.mesh_btn.style = s_yellow
                         self.outline_btn.style = s_yellow
                         self.pth_btn.style = s_green
+                        # Record what was just baked, while the adapter still
+                        # holds the assignment and the volume. Export reads the
+                        # provenance rather than the stage, so a bake that is
+                        # not recorded here never reaches the run -- the run
+                        # would fall back to deriving its own volume and bake a
+                        # different mesh from the one being authored against.
+                        try:
+                            self._ensure_scenario_manager().record_bake()
+                        except Exception as exc:
+                            print(f"[NavMesh UI] Could not record the bake: {exc}")
                     else:
                         print("[NavMesh UI] Navmesh build failed. Ensure walkable geometry is selected and covered by the volume.")
 

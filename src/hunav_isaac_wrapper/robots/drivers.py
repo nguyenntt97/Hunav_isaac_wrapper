@@ -19,9 +19,35 @@ The split that matters is *when* control is applied:
     ``on_render_step``.
 """
 
+import os as _os
+
 import numpy as np
 
+from ..perf import get_profiler
 from .specs import GO2_MAX_ANGULAR, GO2_MAX_LINEAR
+
+
+def go2_policy_disabled():
+    """Whether HUNAV_GO2_POLICY has switched the locomotion policy off.
+
+    Opt-in only: unset -- or any value other than the ones below -- leaves the
+    policy running exactly as before.
+
+    It exists for frame-time measurement. The policy is a CUDA inference every
+    fourth physics substep plus a torque write on every one, ten substeps per
+    rendered frame, and on a contended GPU that has measured anywhere from 8 ms
+    to 91 ms of a single frame. There is no other way to price it out of a
+    profile, because the cost is not in any one call this code owns.
+
+        HUNAV_GO2_POLICY=off
+
+    The robot then holds its spawn stance and does not walk, so a run with this
+    set measures frame time and nothing else -- never gait, tracking or
+    anything that depends on the robot moving.
+    """
+    return _os.environ.get("HUNAV_GO2_POLICY", "").strip().lower() in (
+        "off", "0", "false", "no", "none",
+    )
 
 
 def _to_numpy(array):
@@ -173,6 +199,51 @@ class Go2PolicyDriver:
         self._explicit = spec.actuation == "explicit"
         self._target = None
         self._gains = None
+        self.perf = get_profiler()
+
+        self._policy_off = go2_policy_disabled()
+        if self._policy_off:
+            frozen = self._float_robot()
+            print(
+                "[hunav] HUNAV_GO2_POLICY=off: the Go2 locomotion policy is "
+                "DISABLED for this run. The robot holds its spawn stance and "
+                f"will not walk ({frozen} bodies floating, gravity off). This is "
+                "a measurement mode -- frame timings are valid, everything about "
+                "the robot's motion is not.",
+                flush=True,
+            )
+
+    def _float_robot(self):
+        """Take gravity off every body in the robot. Returns how many.
+
+        Skipping the policy leaves the joints with no torque at all -- the
+        explicit actuation path deliberately zeroes PhysX's own PD drives -- so
+        under gravity the robot would fold up and settle on the ground. A
+        collapsed articulation is a different problem for the solver than a
+        standing one, which would change the very frame time this mode exists to
+        measure. Floating it keeps the articulation in the solver, in its spawn
+        pose, at a cost of nothing per step.
+
+        Authored here rather than at the first physics step so PhysX reads it
+        when the articulation is parsed.
+        """
+        import omni.usd
+        from pxr import PhysxSchema, Usd, UsdPhysics
+
+        stage = omni.usd.get_context().get_stage()
+        root = stage.GetPrimAtPath(self.prim_path) if stage else None
+        if not (root and root.IsValid()):
+            return 0
+
+        frozen = 0
+        for prim in Usd.PrimRange(root):
+            if not prim.HasAPI(UsdPhysics.RigidBodyAPI):
+                continue
+            PhysxSchema.PhysxRigidBodyAPI.Apply(prim).CreateDisableGravityAttr(
+                True
+            ).Set(True)
+            frozen += 1
+        return frozen
 
     def _init_explicit_actuation(self):
         """Zero PhysX's PD drives and take over torque generation.
@@ -255,16 +326,21 @@ class Go2PolicyDriver:
             policy._previous_action = torch.zeros(12, device=device)
             policy._current_action = torch.zeros(12, device=device)
 
+        # Split, because the two halves run at different rates and the profile
+        # cannot otherwise say which one to attack: inference fires once every
+        # `_decimation` substeps, the torque write on every one.
         if policy._policy_counter % policy._decimation == 0:
-            obs = policy._compute_observation(self._command_tensor())
-            policy._current_action = policy._compute_action(obs)
-            policy._previous_action = policy._current_action.clone()
-            self._target = policy.default_pos + policy._current_action * policy._action_scale
+            with self.perf.span("go2_infer"):
+                obs = policy._compute_observation(self._command_tensor())
+                policy._current_action = policy._compute_action(obs)
+                policy._previous_action = policy._current_action.clone()
+                self._target = policy.default_pos + policy._current_action * policy._action_scale
         policy._policy_counter += 1
 
         # Torque is recomputed every physics step from fresh joint state, which
         # is what Articulation.write_data_to_sim does inside Isaac Lab's loop.
-        self._apply_explicit_torque()
+        with self.perf.span("go2_torque"):
+            self._apply_explicit_torque()
 
     @property
     def robot(self):
@@ -299,6 +375,12 @@ class Go2PolicyDriver:
             self._physics_ready = False
 
         if self._physics_ready:
+            if self._policy_off:
+                # The one-time setup in the branch below has already run, so the
+                # articulation view and every read HuNavManager makes off this
+                # driver stay valid. Only the recurring work disappears -- which
+                # is exactly the cost this mode exists to price out.
+                return
             if self._explicit:
                 self._forward_explicit(dt)
             else:

@@ -309,14 +309,15 @@ class HuNavManager:
         # returning an empty navmesh rather than raising -- so the motion
         # library payload and eight character assets are loaded afterwards.
         self.driver.configure_navmesh()
-        bounds = self._agent_activity_bounds() or self._world_bounds()
-        self.driver.ensure_navmesh_volume(bounds=bounds)
-        # Ground level the agents stand at: the volume's own floor is padded
-        # well below it and is not a usable reference for what is walkable.
-        ground_z = (bounds[0][2] + self._NAVMESH_Z_BELOW) if bounds else 0.0
-        self.driver.bake_navmesh(
-            extent=self.driver.navmesh_extent, ground_z=ground_z
-        )
+        if not self._bake_authored_navmesh():
+            bounds = self._agent_activity_bounds() or self._world_bounds()
+            self.driver.ensure_navmesh_volume(bounds=bounds)
+            # Ground level the agents stand at: the volume's own floor is padded
+            # well below it and is not a usable reference for what is walkable.
+            ground_z = (bounds[0][2] + self._NAVMESH_Z_BELOW) if bounds else 0.0
+            self.driver.bake_navmesh(
+                extent=self.driver.navmesh_extent, ground_z=ground_z
+            )
 
         self.driver.load_motion_library()
 
@@ -401,6 +402,58 @@ class HuNavManager:
     # Vertical band the navmesh covers, relative to the agents' ground level.
     _NAVMESH_Z_BELOW = 2.0
     _NAVMESH_Z_ABOVE = 4.0
+
+    def _bake_authored_navmesh(self):
+        """Bake the navmesh this scenario was authored against, if it records one.
+
+        A scenario's spawns and goals only mean anything on the navmesh they
+        were validated against. Deriving a volume from the agents' own extent --
+        what _agent_activity_bounds does below -- bakes a different mesh: on
+        brownstone it covers 73 x 110 m against the 85 x 130 m the scenario was
+        authored on, so a route that detours outside the agents' own hull is
+        walkable while authoring and missing at run time, with nothing to say so.
+
+        Returns False when the scenario records no assignment, or when
+        reproducing it failed; the caller then derives its own bake.
+        """
+        if _os.environ.get("HUNAV_NAVMESH_IGNORE_AUTHORED", "0").strip().lower() in (
+                "1", "true", "yes", "on"):
+            print(
+                "[HuNavManager] HUNAV_NAVMESH_IGNORE_AUTHORED=1: deriving the navmesh "
+                "volume from the agents rather than reproducing the authored bake."
+            )
+            return False
+        if self.config is None or self.driver is None:
+            return False
+
+        from .scenario.bake import navmesh_settings_digest
+        from .scenario.spec import NavmeshProvenance
+
+        authoring = self.config.get("hunav_isaac_authoring") or {}
+        block = (authoring.get("ros__parameters") or {}).get("navmesh")
+        if not isinstance(block, dict):
+            return False
+
+        provenance = NavmeshProvenance.from_block(block)
+        if not provenance.has_assignment:
+            print(
+                "[HuNavManager] this scenario records navmesh settings but no mesh "
+                "assignment, so there is no authored navmesh to reproduce. Re-export "
+                "from --author-scenario after Assign Mesh + Build Navmesh to bind the "
+                "run to the navmesh you designed."
+            )
+            return False
+
+        recomputed = navmesh_settings_digest(provenance.bake_settings)
+        if provenance.settings_digest and recomputed != provenance.settings_digest:
+            print(
+                f"[HuNavManager] WARNING: the scenario's navmesh digest "
+                f"({provenance.settings_digest}) does not match its own recorded "
+                f"settings ({recomputed}). The block has been edited by hand; the "
+                "settings are what will be baked."
+            )
+
+        return self.driver.bake_authored_navmesh(provenance)
 
     def _agent_activity_bounds(self):
         """Extent of everywhere the agents actually go, padded.

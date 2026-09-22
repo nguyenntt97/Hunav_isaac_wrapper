@@ -145,6 +145,40 @@ class NavmeshProvenance:
     ground_z: float = 0.0
     sampling_cm: float = 0.0
 
+    # The prims the author assigned in the navmesh helper, and the settings that
+    # bake ran with. Without them a run can only guess at a volume and bakes a
+    # different mesh from the one the spawns and goals were validated against;
+    # with them it reproduces the authored bake instead. `volume_min`/`max` are
+    # the NavMeshVolume's own box when an assignment is present, so applying
+    # them needs no padding -- padding them again would widen the bake past what
+    # was designed.
+    assigned_prims: Tuple[str, ...] = ()
+    assigned_mesh_count: int = 0
+    bake_settings: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def has_assignment(self) -> bool:
+        """Whether this scenario carries a navmesh design a run can reproduce."""
+        return bool(self.assigned_prims)
+
+    @classmethod
+    def from_block(cls, nav_block: Dict[str, Any]) -> "NavmeshProvenance":
+        """Parse a `hunav_isaac_authoring.ros__parameters.navmesh` mapping.
+
+        Shared with the simulator, which reads the same block straight out of
+        the scenario file without building a whole ScenarioSpec around it.
+        """
+        return cls(
+            settings_digest=str(nav_block.get("settings_digest", "")),
+            volume_min=tuple(nav_block.get("volume_min", (0.0, 0.0, 0.0))),
+            volume_max=tuple(nav_block.get("volume_max", (0.0, 0.0, 0.0))),
+            ground_z=float(nav_block.get("ground_z", 0.0)),
+            sampling_cm=float(nav_block.get("sampling_cm", 0.0)),
+            assigned_prims=tuple(nav_block.get("assigned_prims") or ()),
+            assigned_mesh_count=int(nav_block.get("assigned_mesh_count") or 0),
+            bake_settings=dict(nav_block.get("bake_settings") or {}),
+        )
+
 
 @dataclass
 class ScenarioSpec:
@@ -187,13 +221,7 @@ class ScenarioSpec:
         auth = raw.get("hunav_isaac_authoring", {}).get("ros__parameters", {})
         nav_block = (auth or {}).get("navmesh")
         if isinstance(nav_block, dict):
-            provenance = NavmeshProvenance(
-                settings_digest=str(nav_block.get("settings_digest", "")),
-                volume_min=tuple(nav_block.get("volume_min", (0.0, 0.0, 0.0))),
-                volume_max=tuple(nav_block.get("volume_max", (0.0, 0.0, 0.0))),
-                ground_z=float(nav_block.get("ground_z", 0.0)),
-                sampling_cm=float(nav_block.get("sampling_cm", 0.0)),
-            )
+            provenance = NavmeshProvenance.from_block(nav_block)
 
         return cls(
             yaml_base_name=str(params.get("yaml_base_name") or fallback_base_name),
@@ -549,6 +577,15 @@ class ScenarioSpec:
             add(f"      volume_max: [{_f3(nav.volume_max[0])}, {_f3(nav.volume_max[1])}, {_f3(nav.volume_max[2])}]")
             add(f"      ground_z: {_f3(nav.ground_z)}")
             add(f"      sampling_cm: {_f(nav.sampling_cm)}")
+            if nav.assigned_prims:
+                add("      assigned_prims:")
+                for path in nav.assigned_prims:
+                    add(f"        - {path}")
+                add(f"      assigned_mesh_count: {int(nav.assigned_mesh_count)}")
+            if nav.bake_settings:
+                add("      bake_settings:")
+                for key in sorted(nav.bake_settings):
+                    add(f"        {key}: {_yaml_scalar(nav.bake_settings[key])}")
 
         return "\n".join(lines) + "\n"
 
@@ -620,6 +657,22 @@ def _basename_no_ext(path: str) -> str:
 def _f3(value: float) -> str:
     """Coordinates, always three decimals and always a float to ROS2."""
     return f"{float(value):.3f}"
+
+
+def _yaml_scalar(value: Any) -> str:
+    """A bake setting rendered so it survives a round trip through safe_load.
+
+    `agentMinRadius` is legitimately None -- the baker derives it from the max
+    radius -- and two settings are bools, which `_f` would render as 1.0/0.0 and
+    silently turn into a different bake.
+    """
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return _f(value)
+    return str(value)
 
 
 def _f(value: float) -> str:

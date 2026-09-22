@@ -19,6 +19,8 @@ import sys
 import tempfile
 import xml.etree.ElementTree as ET
 
+import yaml
+
 sys.path.insert(
     0, os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir))
 )
@@ -34,12 +36,16 @@ from hunav_isaac_wrapper.scenario.generate import (  # noqa: E402
     expand_behavior_mix,
     parse_behavior_mix,
 )
+from hunav_isaac_wrapper.scenario.bake import (  # noqa: E402
+    navmesh_settings_digest,
+)
 from hunav_isaac_wrapper.scenario.spec import (  # noqa: E402
     BEHAVIOR_TYPES,
     BEH_CONF_CUSTOM,
     BEH_CONF_DEFAULT,
     AgentSpec,
     BehaviorSpec,
+    NavmeshProvenance,
     Pose,
     ScenarioSpec,
 )
@@ -161,6 +167,42 @@ def _():
     assert again.yaml_base_name == spec.yaml_base_name
     for before, after in zip(spec.sorted_agents(), again.sorted_agents()):
         assert before == after, f"{before.name} changed across the round trip"
+
+
+@check("a navmesh assignment survives the yaml round trip")
+def _():
+    settings = {
+        "cellSize": 0.3, "agentHeight": 2.0, "agentRadius": 0.6,
+        "agentMinRadius": None, "agentMaxClimb": 0.9, "agentMaxSlope": 45.0,
+        "agentMinIslandRadius": 2.0, "excludeRigidBodies": True, "useGpu": True,
+    }
+    spec = tiny_spec()
+    spec.navmesh = NavmeshProvenance(
+        settings_digest=navmesh_settings_digest(settings),
+        volume_min=(-53.0, -85.0, -2.0), volume_max=(32.0, 44.95, 4.0),
+        ground_z=0.0, sampling_cm=30.0,
+        assigned_prims=("/World/brownstone/Paths", "/World/brownstone/Plaza"),
+        assigned_mesh_count=214, bake_settings=settings,
+    )
+    again = ScenarioSpec.from_dict(yaml.safe_load(spec.to_yaml())).navmesh
+
+    assert again.has_assignment, "the run would fall back to deriving its own bake"
+    assert again.assigned_prims == spec.navmesh.assigned_prims, again.assigned_prims
+    assert again.assigned_mesh_count == 214, again.assigned_mesh_count
+    # A bool rendered as 1.0, or None rendered as 0.0, is a different bake.
+    assert again.bake_settings == settings, again.bake_settings
+    assert navmesh_settings_digest(again.bake_settings) == again.settings_digest
+
+
+@check("a scenario with no assignment still parses, and says it has none")
+def _():
+    root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, "scenarios")
+    )
+    spec = ScenarioSpec.from_yaml(os.path.join(root, "brownstone_agents.yaml"))
+    assert spec.navmesh is not None, "the authoring block stopped parsing"
+    assert not spec.navmesh.has_assignment
+    assert spec.navmesh.bake_settings == {}
 
 
 @check("write_yaml forces yaml_base_name to match the filename")

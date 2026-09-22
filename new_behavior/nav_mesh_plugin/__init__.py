@@ -7,7 +7,25 @@ backed by Isaac Sim's native omni.anim.navigation.core and USD 24+.
 
 from . import usd_utils
 from .core import NavmeshInterface, NativeNavmeshInterface, DEFAULT_RECAST_SETTINGS
-from .ui_window import NavmeshWindow, NavmeshExtension, SiborgCreateNavmeshExtension, show_navmesh_window
+
+# The window is imported lazily. Reproducing an authored navmesh at run time
+# needs core.py and nothing else, and it runs in sessions that never open the
+# editor -- importing omni.ui here would make a headless bake depend on the UI
+# being available.
+_UI_NAMES = frozenset({
+    "NavmeshWindow",
+    "NavmeshExtension",
+    "SiborgCreateNavmeshExtension",
+    "show_navmesh_window",
+})
+
+
+def __getattr__(name):
+    if name in _UI_NAMES:
+        from . import ui_window
+
+        return getattr(ui_window, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def build_and_visualize_navmesh(

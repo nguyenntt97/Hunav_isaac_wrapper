@@ -27,6 +27,7 @@ from . import pins
 # package always lives under hunav_isaac_wrapper.
 try:
     from hunav_isaac_wrapper.scenario import paths as scenario_paths
+    from hunav_isaac_wrapper.scenario.bake import navmesh_settings_digest
     from hunav_isaac_wrapper.scenario.bt_emit import emit_all_trees, verify_trees
     from hunav_isaac_wrapper.scenario.generate import build_scenario, parse_behavior_mix
     from hunav_isaac_wrapper.scenario.spec import (
@@ -43,6 +44,7 @@ except ImportError:  # pragma: no cover - only when src/ is not on sys.path
     if _src not in sys.path:
         sys.path.insert(0, _src)
     from hunav_isaac_wrapper.scenario import paths as scenario_paths
+    from hunav_isaac_wrapper.scenario.bake import navmesh_settings_digest
     from hunav_isaac_wrapper.scenario.bt_emit import emit_all_trees, verify_trees
     from hunav_isaac_wrapper.scenario.generate import build_scenario, parse_behavior_mix
     from hunav_isaac_wrapper.scenario.spec import (
@@ -81,9 +83,10 @@ class ScenarioManager:
         if self.navmesh_ready:
             return True
         print(
-            "[ScenarioManager] no navmesh. Bake through the simulator's driver "
-            "first -- baking from this window uses different settings and would "
-            "produce a mesh the agents are not steered on."
+            "[ScenarioManager] no navmesh. Select the walkable meshes, press "
+            "Assign Mesh, then Build Navmesh -- spawns and goals are sampled and "
+            "validated against the baked mesh, and that bake is the one the run "
+            "reproduces once it is exported."
         )
         return False
 
@@ -92,6 +95,56 @@ class ScenarioManager:
         self.provenance = provenance
         if self.spec is not None:
             self.spec.navmesh = provenance
+
+    def record_bake(self, ground_z: Optional[float] = None) -> Optional[NavmeshProvenance]:
+        """Record the bake the adapter just did, so a run can reproduce it.
+
+        Called after a successful Build Navmesh. Without this the exported
+        provenance still describes the driver's start-up bake rather than the
+        one the author designed, and the run then bakes a different mesh from
+        the one the spawns and goals were validated against -- silently, because
+        a scenario that bakes at all looks like it worked.
+        """
+        try:
+            described = self.adapter.describe_bake()
+        except Exception as exc:
+            print(f"[ScenarioManager] could not record the bake: {exc}")
+            return None
+
+        if not described.get("assigned_prims"):
+            print(
+                "[ScenarioManager] nothing is assigned, so this bake covers the "
+                "whole volume and carries no design into the run. Select the "
+                "walkable meshes, press Assign Mesh, then Build Navmesh again."
+            )
+            return None
+        if described.get("volume_min") is None:
+            print("[ScenarioManager] no NavMeshVolume on stage; bake not recorded.")
+            return None
+
+        settings = described["bake_settings"]
+        # cellSize is in metres in this dict and centimetres in the scenario,
+        # under the same <15 rule _configure_bake converts by.
+        cell = float(settings.get("cellSize") or 0.0)
+        provenance = NavmeshProvenance(
+            settings_digest=navmesh_settings_digest(settings),
+            volume_min=tuple(described["volume_min"]),
+            volume_max=tuple(described["volume_max"]),
+            ground_z=float(self._ground_z() if ground_z is None else ground_z),
+            sampling_cm=cell * 100.0 if cell < 15.0 else cell,
+            assigned_prims=tuple(described["assigned_prims"]),
+            assigned_mesh_count=int(described["assigned_mesh_count"]),
+            bake_settings=settings,
+        )
+        self.set_provenance(provenance)
+        print(
+            "[ScenarioManager] recorded the navmesh design: "
+            f"{len(provenance.assigned_prims)} assigned prim(s) -> "
+            f"{provenance.assigned_mesh_count} mesh(es) at "
+            f"{provenance.sampling_cm:.1f} cm sampling. Export writes it into the "
+            "scenario, and the run bakes this same mesh."
+        )
+        return provenance
 
     # --- loading --------------------------------------------------------
 

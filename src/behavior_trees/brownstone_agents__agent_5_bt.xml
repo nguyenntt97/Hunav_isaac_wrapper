@@ -66,17 +66,17 @@
         <SetGoal agent_id="{id}" goal_id="13"/>
       </RunOnce>
       <RunOnce>
-        <SetGoal agent_id="{id}" goal_id="7"/>
+        <SetGoal agent_id="{id}" goal_id="15"/>
       </RunOnce>
       <RunOnce>
-        <SetGoal agent_id="{id}" goal_id="5"/>
+        <SetGoal agent_id="{id}" goal_id="2"/>
       </RunOnce>
       <RunOnce>
-        <SetGoal agent_id="{id}" goal_id="14"/>
+        <SetGoal agent_id="{id}" goal_id="9"/>
       </RunOnce>
       <Inverter>
         <RunOnce>
-          <SetGoal agent_id="{id}" goal_id="2"/>
+          <SetGoal agent_id="{id}" goal_id="7"/>
         </RunOnce>
       </Inverter>
     </Sequence>

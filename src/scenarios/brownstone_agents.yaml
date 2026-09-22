@@ -6,50 +6,50 @@ hunav_loader:
     publish_people: true
     global_goals:
       1:
-        x: 2.112
-        y: -8.478
+        x: 16.302
+        y: -53.383
       2:
-        x: -30.213
-        y: -24.955
+        x: 5.046
+        y: 7.951
       3:
-        x: -6.524
-        y: -41.253
+        x: 10.135
+        y: -37.624
       4:
-        x: -31.814
-        y: -70.564
+        x: 14.362
+        y: -2.712
       5:
-        x: -2.272
-        y: -31.124
+        x: 14.886
+        y: -44.617
       6:
-        x: -9.476
-        y: 7.417
+        x: 12.273
+        y: -31.058
       7:
-        x: 13.281
-        y: 0.351
+        x: 11.866
+        y: 28.589
       8:
-        x: -43.188
-        y: 19.421
+        x: 12.060
+        y: -26.773
       9:
-        x: 14.232
-        y: -10.896
+        x: 11.924
+        y: 21.459
       10:
-        x: -12.590
-        y: -7.585
+        x: 6.319
+        y: -6.338
       11:
-        x: -29.450
-        y: -4.559
+        x: 10.610
+        y: 18.004
       12:
-        x: 17.457
-        y: 12.194
+        x: 16.316
+        y: -59.014
       13:
-        x: -25.697
-        y: 25.462
+        x: 3.819
+        y: -12.232
       14:
-        x: 5.573
-        y: -47.441
+        x: 11.745
+        y: -42.109
       15:
-        x: 17.996
-        y: -36.977
+        x: 10.037
+        y: -3.090
     agents:
       - agent1
       - agent2
@@ -68,10 +68,10 @@ hunav_loader:
       goal_radius: 0.3
       cyclic_goals: true
       init_pose:
-        x: 1.439
-        y: 2.845
-        z: -0.000
-        h: 2.745
+        x: 6.538
+        y: -14.805
+        z: -0.051
+        h: -1.138
       behavior:
         type: Regular
         configuration: 1
@@ -84,11 +84,11 @@ hunav_loader:
         social_force_factor: 5.0
         other_force_factor: 20.0
       goals:
-        - 6
-        - 7
-        - 5
-        - 13
         - 8
+        - 6
+        - 14
+        - 5
+        - 7
     agent2:
       id: 2
       group_id: -1
@@ -98,10 +98,10 @@ hunav_loader:
       goal_radius: 0.3
       cyclic_goals: true
       init_pose:
-        x: -39.334
-        y: -67.358
-        z: -0.002
-        h: -0.403
+        x: 6.776
+        y: 11.977
+        z: 0.000
+        h: 1.073
       behavior:
         type: Regular
         configuration: 1
@@ -114,11 +114,11 @@ hunav_loader:
         social_force_factor: 5.0
         other_force_factor: 20.0
       goals:
+        - 9
         - 4
+        - 10
         - 3
         - 5
-        - 10
-        - 9
     agent3:
       id: 3
       group_id: -1
@@ -128,10 +128,10 @@ hunav_loader:
       goal_radius: 0.3
       cyclic_goals: true
       init_pose:
-        x: -31.460
-        y: -32.811
-        z: 0.000
-        h: 1.413
+        x: 11.843
+        y: 28.654
+        z: -0.000
+        h: -1.686
       behavior:
         type: Curious
         configuration: 1
@@ -144,11 +144,11 @@ hunav_loader:
         social_force_factor: 5.0
         other_force_factor: 20.0
       goals:
+        - 11
         - 2
-        - 10
-        - 5
         - 3
-        - 13
+        - 14
+        - 5
     agent4:
       id: 4
       group_id: -1
@@ -158,10 +158,10 @@ hunav_loader:
       goal_radius: 0.3
       cyclic_goals: true
       init_pose:
-        x: -17.256
-        y: 26.099
-        z: -0.014
-        h: -1.433
+        x: 16.316
+        y: -51.315
+        z: -0.051
+        h: 1.768
       behavior:
         type: Regular
         configuration: 1
@@ -174,11 +174,11 @@ hunav_loader:
         social_force_factor: 5.0
         other_force_factor: 20.0
       goals:
+        - 6
+        - 13
         - 10
-        - 9
-        - 12
-        - 15
-        - 3
+        - 4
+        - 11
     agent5:
       id: 5
       group_id: -1
@@ -188,10 +188,10 @@ hunav_loader:
       goal_radius: 0.3
       cyclic_goals: true
       init_pose:
-        x: -11.605
-        y: 6.391
-        z: 0.000
-        h: 2.207
+        x: 13.271
+        y: -41.073
+        z: -0.051
+        h: 1.888
       behavior:
         type: Regular
         configuration: 1
@@ -205,10 +205,10 @@ hunav_loader:
         other_force_factor: 20.0
       goals:
         - 13
-        - 7
-        - 5
-        - 14
+        - 15
         - 2
+        - 9
+        - 7
     agent6:
       id: 6
       group_id: -1
@@ -218,10 +218,10 @@ hunav_loader:
       goal_radius: 0.3
       cyclic_goals: true
       init_pose:
-        x: -19.675
-        y: -71.507
-        z: -0.000
-        h: 1.793
+        x: 10.627
+        y: -2.295
+        z: -0.051
+        h: -2.388
       behavior:
         type: Regular
         configuration: 1
@@ -234,11 +234,11 @@ hunav_loader:
         social_force_factor: 5.0
         other_force_factor: 20.0
       goals:
+        - 10
         - 2
-        - 6
         - 7
-        - 9
         - 8
+        - 12
     agent7:
       id: 7
       group_id: -1
@@ -248,10 +248,10 @@ hunav_loader:
       goal_radius: 0.3
       cyclic_goals: true
       init_pose:
-        x: -41.453
-        y: -31.982
-        z: -0.000
-        h: 1.158
+        x: 4.049
+        y: -13.177
+        z: -0.051
+        h: 1.250
       behavior:
         type: Scared
         configuration: 1
@@ -264,11 +264,11 @@ hunav_loader:
         social_force_factor: 5.0
         other_force_factor: 20.0
       goals:
-        - 11
         - 10
-        - 6
-        - 9
         - 4
+        - 11
+        - 9
+        - 8
     agent8:
       id: 8
       group_id: -1
@@ -278,10 +278,10 @@ hunav_loader:
       goal_radius: 0.3
       cyclic_goals: true
       init_pose:
-        x: -25.457
-        y: 26.757
+        x: 13.256
+        y: 26.568
         z: -0.000
-        h: -2.749
+        h: -1.826
       behavior:
         type: Curious
         configuration: 1
@@ -294,17 +294,34 @@ hunav_loader:
         social_force_factor: 5.0
         other_force_factor: 20.0
       goals:
-        - 8
-        - 1
         - 9
+        - 10
+        - 14
         - 5
-        - 15
+        - 1
 
 hunav_isaac_authoring:
   ros__parameters:
     navmesh:
-      settings_digest: 6f7a13b534b7
-      volume_min: [-53.000, -85.000, -2.000]
-      volume_max: [32.000, 44.950, 4.000]
+      settings_digest: 1d491be179b6
+      volume_min: [-4.491, -63.583, -2.619]
+      volume_max: [18.266, 31.438, 2.500]
       ground_z: 0.000
-      sampling_cm: 20.0
+      sampling_cm: 30.0
+      assigned_prims:
+        - /World/Environment/ParkDeOv/Geometry/Pathways/Mesh_7dcc7d3c1173417d8c7fd83bce581583
+        - /World/Environment/ParkDeOv/Geometry/Grass/Mesh_0d6fe94e007840c69b62ea5908848e4d
+        - /World/Environment/ParkDeOv/Geometry/Hardscape/Adjusted/Mesh_95da68790a88447e89f656771f7027a3
+        - /World/Environment/ParkDeOv/Geometry/Pathways/Mesh_2dbfb2b335394f5ab1112d2cbed1dd8a
+        - /World/Environment/ParkDeOv/Geometry/Pathways/Mesh_1b524b3b371d4009b7b9d8a82062f342
+      assigned_mesh_count: 5
+      bake_settings:
+        agentHeight: 2.0
+        agentMaxClimb: 0.9
+        agentMaxSlope: 45.0
+        agentMinIslandRadius: 2.0
+        agentMinRadius: null
+        agentRadius: 0.6
+        cellSize: 0.3
+        excludeRigidBodies: true
+        useGpu: true

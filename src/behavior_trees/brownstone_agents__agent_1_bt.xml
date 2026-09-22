@@ -63,20 +63,20 @@
     <!-- Goal ring -->
     <Sequence name="SetGoals">
       <RunOnce>
+        <SetGoal agent_id="{id}" goal_id="8"/>
+      </RunOnce>
+      <RunOnce>
         <SetGoal agent_id="{id}" goal_id="6"/>
       </RunOnce>
       <RunOnce>
-        <SetGoal agent_id="{id}" goal_id="7"/>
+        <SetGoal agent_id="{id}" goal_id="14"/>
       </RunOnce>
       <RunOnce>
         <SetGoal agent_id="{id}" goal_id="5"/>
       </RunOnce>
-      <RunOnce>
-        <SetGoal agent_id="{id}" goal_id="13"/>
-      </RunOnce>
       <Inverter>
         <RunOnce>
-          <SetGoal agent_id="{id}" goal_id="8"/>
+          <SetGoal agent_id="{id}" goal_id="7"/>
         </RunOnce>
       </Inverter>
     </Sequence>
