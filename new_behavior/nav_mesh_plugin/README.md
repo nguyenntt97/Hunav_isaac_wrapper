@@ -168,12 +168,85 @@ Measured on a 60 × 60 m ground slab with two 4 × 4 m platforms assigned:
 | Before | X[-7, 7] Y[-4, 4] Z[0.00, 0.50] | 10749 |
 | After | X[-4.76, 4.76] Y[-1.76, 1.76] Z[0.50] | 0 |
 
-Two things to know:
+#### An unassigned obstacle does not obstruct — it disappears
+
+This is the one behaviour that surprises people, and it is `ov_navmesh`'s
+behaviour too. The bake sees only what you assigned. A wall that you did not
+assign is not treated as an obstacle; it is simply absent, and the navmesh runs
+straight through where it stands. **For geometry to block the agent, it has to
+be part of the assignment.** In practice that means assigning the room, not the
+floor — assign a parent `Xform` and every visible `UsdGeom.Mesh` beneath it is
+resolved, instance proxies included.
+
+Two further things to know:
 
 - Callers that never assign anything are unaffected — with no selection nothing
   is hidden, so `build_and_visualize_navmesh()` and the runtime bake behave
   exactly as before.
 - Pass `restrict_to_assigned=False` to get the old whole-volume behaviour.
+
+##### Instanced geometry
+
+Visibility cannot be authored on an instance proxy, only on the prototype it
+points at — and a prototype's visibility affects *every* instance of it. So the
+keep-set records both the resolved mesh path and, for proxies, the prototype's
+source paths (walked out of `GetPrimStack()`; `Usd.Stage.TraverseAll()` yields
+the source prims, not the prototypes). Where an assigned mesh and an unassigned
+one share a prototype, precise hiding is impossible; the adapter keeps both and
+logs a single warning naming the prototype rather than silently hiding the
+assignment.
+
+### Which settings the native baker actually honours
+
+All native lengths are centimetres (`# unit: cm [default in kit]` in
+`omni.anim.navigation.core-110.1.4/config/extension.toml`); the keys below are
+metres and degrees, as `ov_navmesh` had them, and are converted on the way in.
+
+| Settings key | Default | Native setting | Native default |
+| --- | --- | --- | --- |
+| `cellSize` | 0.3 m | `agentSamplingDistance` | 20 cm |
+| `agentHeight` | 2.0 m | `agentMinHeight` | 200 cm |
+| `agentRadius` | 0.6 m | `agentMaxRadius` | 50 cm |
+| `agentMaxClimb` | 0.9 m | `agentMaxStepHeight` | 25 cm |
+| `agentMaxSlope` | 45° | `agentMaxFloorSlope` | 20° |
+| `agentMinRadius` | `None` → `agentRadius × 0.4` | `agentMinRadius` | 20 cm |
+| `agentMinIslandRadius` | 2.0 m | `agentMinIslandRadius` | 200 cm |
+| `excludeRigidBodies` | `True` | `excludeRigidBodies` | — |
+| `useGpu` | `True` | `navMesh/useGpu` | — |
+
+The last four have no `ov_navmesh` equivalent:
+
+- **`agentMinRadius`** — the native baker takes a radius *range*, not one
+  radius. The `× 0.4` default is not invented: it reproduces the shipped 20/50
+  cm pair. Set it directly to override.
+- **`agentMinIslandRadius`** — drops navmesh islands smaller than this radius.
+  `regionMinSize` is kept as a deprecated alias and converted by area
+  equivalence, `r = regionMinSize × cellSize / sqrt(pi)` (≈ 1.35 m at defaults).
+  Recast squares `regionMinSize` (a linear voxel count) into an area; the native
+  setting is a radius, so the two are not interchangeable and the old `× 10`
+  conversion had no basis in either API.
+- **`useGpu`** — the GPU baker fails by returning an *empty* navmesh after
+  logging `CUDA error: out of memory`. Turning it off is the only lever when
+  that happens, so it is exposed in the UI.
+
+**Eight `ov_navmesh` keys have no native equivalent.** They are still accepted,
+so existing settings dicts keep working, but they reach nothing:
+`cellHeight`, `regionMergeSize`, `edgeMaxLen`, `edgeMaxError`, `vertsPerPoly`,
+`detailSampleDist`, `detailSampleMaxError`, `partitionType`. Passing one now
+logs a single warning naming the keys you actually passed — silently dropping
+them made a settings change look like it had had no effect.
+
+#### Volume padding
+
+`ensure_navmesh_volume()` no longer pads a fixed +4 m in X/Y with a 6 m Z
+minimum. It hugs the assignment and derives its headroom from the settings in
+force: `agentRadius + 0.5` in X/Y, `agentHeight + 0.5` above the selection and
+`agentMaxClimb + 0.5` below it. The Z box is therefore asymmetric — a surface
+only qualifies as walkable with `agentMinHeight` of clearance above it, which is
+what the old 6 m minimum was blindly approximating.
+
+`behavior_agent.py` has its own `ensure_navmesh_volume` for the runtime bake;
+this change is confined to the plugin's bake path.
 
 ## 5. Phase-by-Phase Implementation Roadmap
 

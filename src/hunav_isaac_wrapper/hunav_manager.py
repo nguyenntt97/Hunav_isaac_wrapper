@@ -42,6 +42,7 @@ from .behavior_agent import (
     STARTUP_EXTENSIONS as BEHAVIOR_EXTENSIONS,
 )
 from .scenario.spec import BEHAVIOR_TYPES, FORCE_FACTOR_RANGES, VEL_RANGE
+from .perf import get_profiler
 
 # These are requested at app startup via SimulationApp's extra_args (see
 # STARTUP_EXTENSIONS in teleop_hunav_sim.py), which is the only point at which
@@ -81,6 +82,18 @@ class HuNavManager:
         # 200 Hz) does not change how often agents are updated. TeleopHuNavSim
         # decimates its physics callback to keep that true.
         self.dt = 1.0 / 20.0
+        self.perf = get_profiler()
+        # Diagnostic, off by default. Agents are still spawned, attached and
+        # ticked by the crowd engine, but no goal is ever issued to them. The
+        # difference between a run with this on and one with it off is the cost
+        # that the agents' movement actually causes, as opposed to the cost the
+        # navmesh and crowd engine carry regardless.
+        self._no_drive = _os.environ.get("HUNAV_NO_DRIVE", "0").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+        if self._no_drive:
+            print("[HuNavManager] HUNAV_NO_DRIVE=1: agents will not be given goals",
+                  flush=True)
         self.robot_prim_path = robot_prim_path
         self.robot_obj = robot
         # Describes the robot HuNavSim is told about. None keeps the historical
@@ -609,6 +622,9 @@ class HuNavManager:
         directions = self.generate_lasers(num_lasers)
         scene_query = omni.physx.get_physx_scene_query_interface()
         closest_hits = []
+        # Counted rather than derived from num_lasers * len(sensor_offsets), so
+        # the figure stays honest if this loop ever gains an early-out.
+        rays_cast = 0
 
         # Iterate over each ray direction
         for direction in directions:
@@ -625,6 +641,7 @@ class HuNavManager:
                 hit = scene_query.raycast_closest(
                     sensor_origin, direction, max_distance
                 )
+                rays_cast += 1
                 if hit.get("hit", False):
                     hit_found = True
                     distance = hit.get("distance", max_distance)
@@ -638,6 +655,7 @@ class HuNavManager:
             else:
                 closest_hits.append((max_distance, None))
 
+        self.perf.count("raycasts", rays_cast)
         return closest_hits
 
     def sample_ground_height(self, x, y, previous_z):
@@ -747,16 +765,22 @@ class HuNavManager:
         # Build robot message
         robot_msg = self._create_robot_msg()
 
-        # For each agent, create and add an Agent message
-        for idx, agent_prim in enumerate(self.agents):
-            agent_msg = self._create_agent_msg(agent_prim, idx)
-            agents_msg.agents.append(agent_msg)
+        # For each agent, create and add an Agent message. This is where the
+        # per-agent obstacle raycasts happen, so the "rays" span nested inside
+        # it is the one to read first.
+        with self.perf.span("msg_build"):
+            for idx, agent_prim in enumerate(self.agents):
+                agent_msg = self._create_agent_msg(agent_prim, idx)
+                agents_msg.agents.append(agent_msg)
 
         # Wait for the compute_agents service and call it
-        if not self.compute_agents_client.wait_for_service(timeout_sec=2.0):
+        with self.perf.span("svc_wait"):
+            available = self.compute_agents_client.wait_for_service(timeout_sec=2.0)
+        if not available:
             print("[HuNavManager] /compute_agents not available.")
             return
-        self._call_compute(agents_msg, robot_msg)
+        with self.perf.span("svc_call"):
+            self._call_compute(agents_msg, robot_msg)
 
     def _create_robot_msg(self):
         # Retrieve robot pose and velocities from the robot driver. Every driver
@@ -971,7 +995,8 @@ class HuNavManager:
         max_distance = 4.0
         agent.closest_obs = []
         sensor_offsets = [0.05, 0.1, 0.25, 0.5, 1.0]
-        hits = self.get_closest_obstacles(pos, max_distance, sensor_offsets)
+        with self.perf.span("rays"):
+            hits = self.get_closest_obstacles(pos, max_distance, sensor_offsets)
         for hit in hits:
             if hit[1] is not None:
                 pt = Point(
@@ -991,13 +1016,19 @@ class HuNavManager:
             req.robot = robot_msg
             future = self.compute_agents_client.call_async(req)
 
-            rclpy.spin_until_future_complete(self.node, future)
+            # This blocks the PhysX step thread for the whole round trip to
+            # hunav_agent_manager, so it is timed on its own: it is latency we
+            # are waiting on, not work we are doing, and the two have different
+            # fixes.
+            with self.perf.span("svc_spin"):
+                rclpy.spin_until_future_complete(self.node, future)
             if future.done():
                 resp = future.result()
                 if resp is None:
                     print("[HuNavManager] No response from service.")
                 else:
-                    self._update_agents(resp.updated_agents)
+                    with self.perf.span("drive"):
+                        self._update_agents(resp.updated_agents)
                 return resp
             else:
                 print("[HuNavManager] Service response not completed.")
@@ -1054,7 +1085,8 @@ class HuNavManager:
                 upd.velocity.linear.y,
                 upd.velocity.linear.z,
             )
-            self.driver.drive(handle, position, velocity)
+            if not self._no_drive:
+                self.driver.drive(handle, position, velocity)
 
             if debug:
                 key = self.agent_skelroots[idx]

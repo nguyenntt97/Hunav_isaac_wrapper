@@ -47,7 +47,7 @@ def live_agents_present(stage) -> bool:
 class NavmeshWindow:
     """Omniverse Kit UI window controlling NavMesh assignment, baking, and visualization."""
 
-    def __init__(self, title: str = "Navmesh", width: int = 340, height: int = 900):
+    def __init__(self, title: str = "Navmesh", width: int = 360, height: int = 650):
         if ui is None:
             raise RuntimeError("omni.ui is not available in this environment.")
 
@@ -64,8 +64,46 @@ class NavmeshWindow:
         self.scenario = None
         self.read_only = live_agents_present(self.stage)
 
+        # Pending tasks for work deferred out of a click handler; see _defer.
+        # Held because asyncio keeps only a weak reference to a running task,
+        # so a task nobody holds can be collected mid-flight.
+        self._deferred = set()
+
         self._window = ui.Window(title, width=width, height=height)
         self._build_ui()
+
+    def _defer(self, fn, name: str = "work"):
+        """Run `fn` on the next app update instead of inside this callback.
+
+        A Button's clicked_fn runs *inside* omni.ui's draw pass. Anything that
+        pumps the app from there re-enters that draw and leaves ImGui's ID
+        stack unbalanced, and Kit then segfaults in ImGui::PopID() -- not on
+        the offending call but on the next widget to pop an id. core.build_navmesh
+        pumps deliberately (visibility edits have to reach the baker before it
+        voxelises), so it must not be called from a click. One frame of delay
+        puts it outside the draw, where pumping is safe.
+        """
+        import asyncio
+        import inspect
+        import traceback
+
+        import omni.kit.app
+
+        async def _next_frame():
+            await omni.kit.app.get_app().next_update_async()
+            try:
+                result = fn()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                # A click handler that raises leaves no trace in the UI, and
+                # the button just looks dead. Print it.
+                print(f"[NavMesh UI] {name} failed:")
+                traceback.print_exc()
+
+        task = asyncio.ensure_future(_next_frame())
+        self._deferred.add(task)
+        task.add_done_callback(self._deferred.discard)
 
     def _ensure_scenario_manager(self):
         """Create the ScenarioManager on first use, sharing this adapter."""
@@ -117,7 +155,14 @@ class NavmeshWindow:
                             "to bake and edit."
                         )
                         return
-                    success = self.navmesh.build_navmesh(settings=self.navmesh_settings)
+                    # Deferred off the draw pass, and awaiting rather than
+                    # pumping once there: see _defer and build_navmesh_async.
+                    self._defer(do_build_navmesh, name="build")
+
+                async def do_build_navmesh():
+                    success = await self.navmesh.build_navmesh_async(
+                        settings=self.navmesh_settings
+                    )
                     if success:
                         self.bld_btn.style = s_done
                         self.rnd_pnts_btn.style = s_green
@@ -207,16 +252,20 @@ class NavmeshWindow:
                     self.clear_btn.style = s_done
                     print("[NavMesh UI] Reset and cleared baked navmesh. Ready to re-bake.")
 
-                # Action Buttons
-                with ui.VStack(spacing=4):
-                    self.assign_btn = ui.Button("Assign Mesh", clicked_fn=assign_mesh, style=s_yellow)
-                    self.bld_btn = ui.Button("Build Navmesh", clicked_fn=build_navmesh, style=s_red)
-                    self.mesh_btn = ui.Button("Create Mesh", clicked_fn=visualize_navmesh, style=s_red)
-                    self.outline_btn = ui.Button("Outline Walls", clicked_fn=outline_navmesh, style=s_red)
-                    self.rnd_pnts_btn = ui.Button("Get Random Points", clicked_fn=get_random_points, style=s_red)
-                    self.rnd_pth_btn = ui.Button("Get Random Path", clicked_fn=get_random_path, style=s_red)
-                    self.pth_btn = ui.Button("Get Start-End Path", clicked_fn=get_specific_path, style=s_red)
-                    self.clear_btn = ui.Button("Reset / Clear NavMesh", clicked_fn=clear_and_reset_navmesh, style=s_yellow)
+                # Action Buttons (2-column table layout)
+                with ui.VStack(spacing=3):
+                    with ui.HStack(height=24, spacing=4):
+                        self.assign_btn = ui.Button("Assign Mesh", clicked_fn=assign_mesh, style=s_yellow)
+                        self.bld_btn = ui.Button("Build Navmesh", clicked_fn=build_navmesh, style=s_red)
+                    with ui.HStack(height=24, spacing=4):
+                        self.mesh_btn = ui.Button("Create Mesh", clicked_fn=visualize_navmesh, style=s_red)
+                        self.outline_btn = ui.Button("Outline Walls", clicked_fn=outline_navmesh, style=s_red)
+                    with ui.HStack(height=24, spacing=4):
+                        self.rnd_pnts_btn = ui.Button("Get Random Points", clicked_fn=get_random_points, style=s_red)
+                        self.rnd_pth_btn = ui.Button("Get Random Path", clicked_fn=get_random_path, style=s_red)
+                    with ui.HStack(height=24, spacing=4):
+                        self.pth_btn = ui.Button("Get Start-End Path", clicked_fn=get_specific_path, style=s_red)
+                        self.clear_btn = ui.Button("Reset / Clear NavMesh", clicked_fn=clear_and_reset_navmesh, style=s_yellow)
 
                 # Auto-detect existing navmesh (e.g. pre-baked HuNav simulation map)
                 if self.navmesh.built:
@@ -250,6 +299,8 @@ class NavmeshWindow:
                     self.navmesh_settings["agentRadius"] = self.agent_radius_float.get_value_as_float()
                     self.navmesh_settings["agentMaxClimb"] = self.agent_step_float.get_value_as_float()
                     self.navmesh_settings["agentMaxSlope"] = self.agent_slope_float.get_value_as_float()
+                    self.navmesh_settings["cellSize"] = self.sampling_float.get_value_as_float()
+                    self.navmesh_settings["useGpu"] = self.use_gpu_bool.get_value_as_bool()
                     print(f"[NavMesh UI] Settings updated: {self.navmesh_settings}")
 
                 def reset_settings():
@@ -258,6 +309,8 @@ class NavmeshWindow:
                     self.agent_radius_float.set_value(0.6)
                     self.agent_step_float.set_value(0.9)
                     self.agent_slope_float.set_value(45.0)
+                    self.sampling_float.set_value(0.3)
+                    self.use_gpu_bool.set_value(True)
                     print("[NavMesh UI] Settings reset to default.")
 
                 with ui.CollapsableFrame("Navmesh Settings", collapsed=False):
@@ -277,6 +330,23 @@ class NavmeshWindow:
                         ui.Label("Max Slope (deg)")
                         self.agent_slope_float = ui.SimpleFloatModel(45.0, min=0.0, max=89.9)
                         ui.FloatSlider(self.agent_slope_float, min=0.0, max=89.9, step=1.0)
+
+                        # Neither ov_navmesh nor earlier revisions of this window
+                        # exposed the voxel size, yet it is the single biggest
+                        # lever on both navmesh quality and bake time: a coarse
+                        # bake that misses narrow paths is almost always this.
+                        ui.Label("Sampling Distance (m)")
+                        self.sampling_float = ui.SimpleFloatModel(0.3, min=0.05, max=2.0)
+                        ui.FloatSlider(self.sampling_float, min=0.05, max=2.0, step=0.05)
+
+                        # The GPU baker fails by returning an *empty* navmesh
+                        # after logging "CUDA error: out of memory" -- see
+                        # behavior_agent.bake_navmesh. Without this toggle there
+                        # is no way to fall back.
+                        with ui.HStack(height=22, spacing=4):
+                            self.use_gpu_bool = ui.SimpleBoolModel(True)
+                            ui.CheckBox(self.use_gpu_bool, width=20)
+                            ui.Label("Use GPU baker (off if bakes come back empty)")
 
                         with ui.HStack(height=28, spacing=4):
                             ui.Button("Set Settings", clicked_fn=set_settings)
@@ -428,31 +498,38 @@ class NavmeshWindow:
                     self.mix_field.model.set_value("Regular:5,Curious:2,Scared:1")
 
                 ui.Spacer(height=2)
-                self.load_btn = ui.Button(
-                    "Load Scenario", clicked_fn=load_scenario, style=s_yellow
-                )
-                self.generate_btn = ui.Button(
-                    "Generate on NavMesh",
-                    clicked_fn=generate_scenario,
-                    style=s_red if self.read_only else s_yellow,
-                )
-                self.snap_btn = ui.Button(
-                    "Snap Pins to NavMesh", clicked_fn=snap_pins, style=s_yellow
-                )
-                self.scatter_btn = ui.Button(
-                    "Scatter Spawns", clicked_fn=scatter_spawns, style=s_yellow
-                )
-                self.validate_btn = ui.Button(
-                    "Validate", clicked_fn=validate_scenario, style=s_yellow
-                )
-                self.export_btn = ui.Button(
-                    "Export YAML + Behavior Trees",
-                    clicked_fn=export_scenario,
-                    style=s_red,
-                )
-                self.clearpins_btn = ui.Button(
-                    "Clear Pins", clicked_fn=clear_pins, style=s_yellow
-                )
+                # Scenario Action Buttons (2-column table layout)
+                with ui.VStack(spacing=3):
+                    with ui.HStack(height=24, spacing=4):
+                        self.load_btn = ui.Button(
+                            "Load Scenario", clicked_fn=load_scenario, style=s_yellow
+                        )
+                        self.generate_btn = ui.Button(
+                            "Generate on NavMesh",
+                            clicked_fn=generate_scenario,
+                            style=s_red if self.read_only else s_yellow,
+                        )
+                    with ui.HStack(height=24, spacing=4):
+                        self.snap_btn = ui.Button(
+                            "Snap Pins to NavMesh", clicked_fn=snap_pins, style=s_yellow
+                        )
+                        self.scatter_btn = ui.Button(
+                            "Scatter Spawns", clicked_fn=scatter_spawns, style=s_yellow
+                        )
+                    with ui.HStack(height=24, spacing=4):
+                        self.validate_btn = ui.Button(
+                            "Validate", clicked_fn=validate_scenario, style=s_yellow
+                        )
+                        self.export_btn = ui.Button(
+                            "Export YAML + BTs",
+                            clicked_fn=export_scenario,
+                            style=s_red,
+                            tooltip="Export YAML + Behavior Trees",
+                        )
+                    with ui.HStack(height=24, spacing=4):
+                        self.clearpins_btn = ui.Button(
+                            "Clear Pins", clicked_fn=clear_pins, style=s_yellow
+                        )
 
     def destroy(self):
         if self._window:

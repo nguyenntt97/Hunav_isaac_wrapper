@@ -121,7 +121,11 @@ def main():
     stage, ground_prim = build_stage()
 
     adapter = NavmeshInterface(stage=stage)
-    assert adapter.load_mesh(ground_prim), "could not load the ground mesh"
+    # Assign the whole room, not just the floor. The bake is restricted to what
+    # is assigned (ov_navmesh semantics), so an unassigned wall is not an
+    # obstacle -- it is simply absent, and the two halves join up. Obstacles
+    # have to be part of the assignment for them to obstruct.
+    assert adapter.load_mesh(stage.GetPrimAtPath("/World")), "could not load the room"
     for _ in range(30):
         app.update()
 

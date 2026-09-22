@@ -122,8 +122,23 @@ def parent_and_children_as_mesh(parent_prim: Usd.Prim):
     return get_mesh(found_meshes)
 
 
-def get_all_stage_mesh(stage: Usd.Stage, prims: list[Usd.Prim]):
-    """Collect all visible mesh prims underneath the given list of prims (or entire stage if empty)."""
+def find_stage_meshes(stage: Usd.Stage, prims: list[Usd.Prim]) -> list[Usd.Prim]:
+    """Resolve a selection to the visible UsdGeom.Mesh prims it contains.
+
+    These are ov_navmesh's selection rules, kept deliberately identical
+    (siborg/create/navmesh/usd_utils.py:get_all_stage_mesh):
+
+      * every selected prim contributes, not just the first;
+      * descend with ``Usd.TraverseInstanceProxies()``, so instanced meshes are
+        found rather than silently skipped;
+      * only ``UsdGeom.Mesh`` counts -- implicit gprims (Cube, Plane, Capsule)
+        are ignored, which is also all the native baker will voxelise;
+      * skip anything whose *computed* visibility is invisible, so hiding a
+        parent excludes its whole subtree.
+
+    Returned separately from the geometry because restricting a bake needs the
+    prims themselves, not the triangle soup.
+    """
     if not prims:
         prims = [stage.GetPseudoRoot()]
 
@@ -142,7 +157,12 @@ def get_all_stage_mesh(stage: Usd.Stage, prims: list[Usd.Prim]):
             if x.IsA(UsdGeom.Mesh):
                 found_meshes.append(x)
 
-    return get_mesh(found_meshes)
+    return found_meshes
+
+
+def get_all_stage_mesh(stage: Usd.Stage, prims: list[Usd.Prim]):
+    """Collect all visible mesh prims underneath the given list of prims (or entire stage if empty)."""
+    return get_mesh(find_stage_meshes(stage, prims))
 
 
 def compute_bounds(prims: list[Usd.Prim], stage: Usd.Stage = None) -> tuple[tuple[float, float, float], tuple[float, float, float]] | None:

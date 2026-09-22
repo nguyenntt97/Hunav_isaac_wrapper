@@ -122,6 +122,46 @@ NAVMESH_SETTINGS = {
 }
 
 
+def _navmesh_overrides():
+    """Per-key overrides from HUNAV_NAVMESH_<KEY>, for tuning runs.
+
+    The per-frame cost of omni.anim.navigation.core is the dominant term in the
+    frame on a map-sized navmesh -- a native profile of brownstone put 99.8% of
+    main-thread samples inside that plugin, called from the crowd simulation on
+    the Kit update tick, and the cost barely moved between 1 and 8 agents. The
+    sampling distance is the knob that decides how many cells that work covers,
+    so it needs to be settable without editing this file.
+
+    Coarsening is not free: raising agentSamplingDistance drops narrow walkable
+    strips out of the bake entirely, and on this map the footpaths are close to
+    that limit. Any override must be checked against the baked mesh, not just
+    the frame rate.
+
+        HUNAV_NAVMESH_AGENTSAMPLINGDISTANCE=50 (centimetres)
+    """
+    out = {}
+    for key in NAVMESH_SETTINGS:
+        raw = _os.environ.get(f"HUNAV_NAVMESH_{key.upper()}")
+        if raw is None or not raw.strip():
+            continue
+        try:
+            out[key] = (
+                raw.strip().lower() in ("1", "true", "yes", "on")
+                if isinstance(NAVMESH_SETTINGS[key], bool)
+                else float(raw)
+            )
+        except ValueError:
+            print(f"[behavior] ignoring bad HUNAV_NAVMESH_{key.upper()}={raw!r}")
+    return out
+
+
+def effective_navmesh_settings():
+    """NAVMESH_SETTINGS with any environment overrides applied."""
+    settings = dict(NAVMESH_SETTINGS)
+    settings.update(_navmesh_overrides())
+    return settings
+
+
 # The GPU navmesh baker allocates per axis-cell and can exhaust CUDA memory.
 # The earlier figure here was 40 cells per axis, measured back when the sampling
 # distance was being passed in metres: those experiments were really running at
@@ -295,6 +335,26 @@ class BehaviorAgentDriver:
         if profiling:
             print("[behavior] crowd-simulation profiling ON")
 
+        # Read the settings back. They are written to two trees and restored
+        # from the persistent one on a stage or timeline reset, so "we called
+        # the setter" is not evidence that the overlay is off -- and the one
+        # that matters costs ~24 s per frame when it is not. One line at
+        # startup turns a silent seconds-per-frame regression into an
+        # obvious one.
+        still_on = [
+            key
+            for key, value in BehaviorAgentDriver._DEBUG_GEOMETRY_SETTINGS
+            if value is False and carb_settings.get(key)
+        ]
+        if still_on:
+            print(
+                "[behavior] WARNING: debug overlays still enabled after "
+                "suppression: " + ", ".join(still_on),
+                flush=True,
+            )
+        else:
+            print("[behavior] debug overlays confirmed off", flush=True)
+
     @staticmethod
     def _apply_navmesh_settings():
         """Push NAVMESH_SETTINGS into carb. See that dict for units."""
@@ -302,11 +362,36 @@ class BehaviorAgentDriver:
 
         prefix = "/exts/omni.anim.navigation.core/navMesh/config"
         carb_settings = carb.settings.get_settings()
-        for key, value in NAVMESH_SETTINGS.items():
+        settings = effective_navmesh_settings()
+        overrides = _navmesh_overrides()
+        if overrides:
+            print(f"[behavior] navmesh overrides from environment: {overrides}")
+        for key, value in settings.items():
             if key == "excludeRigidBodies":
                 carb_settings.set(f"{prefix}/{key}", bool(value))
             else:
                 carb_settings.set(f"{prefix}/{key}", float(value))
+        # navMesh/useGpu and navMesh/viewNavMesh live one level up from config/
+        # and are read from the persistent tree. Both are exposed for tuning
+        # runs; unset leaves the plugin's own defaults (useGpu on, view off).
+        for name, env in (("useGpu", "HUNAV_NAVMESH_USEGPU"),
+                          ("maxVerticesPerTile", "HUNAV_NAVMESH_MAXVERTICESPERTILE")):
+            raw = _os.environ.get(env)
+            if raw is None or not raw.strip():
+                continue
+            key = f"/exts/omni.anim.navigation.core/navMesh/{name}"
+            if name == "useGpu":
+                val = raw.strip().lower() in ("1", "true", "yes", "on")
+            else:
+                try:
+                    val = int(raw)
+                except ValueError:
+                    print(f"[behavior] ignoring bad {env}={raw!r}")
+                    continue
+            carb_settings.set(key, val)
+            carb_settings.set("/persistent" + key, val)
+            print(f"[behavior] navmesh {name} = {val} (from {env})")
+
         # omni.anim.behavior.core ships its crowd-simulation debug overlays ON:
         # showAgentDistanceField, showObstacleDistanceField, showAreaDistanceField
         # and showBorderDistanceField all default to true. Those are GPU distance
@@ -319,9 +404,9 @@ class BehaviorAgentDriver:
 
         print(
             "[behavior] navmesh settings (centimetres): "
-            f"minRadius={NAVMESH_SETTINGS['agentMinRadius']} "
-            f"minHeight={NAVMESH_SETTINGS['agentMinHeight']} "
-            f"sampling={NAVMESH_SETTINGS['agentSamplingDistance']}"
+            f"minRadius={settings['agentMinRadius']} "
+            f"minHeight={settings['agentMinHeight']} "
+            f"sampling={settings['agentSamplingDistance']}"
             " (crowd debug overlays off)"
         )
 
@@ -520,7 +605,11 @@ class BehaviorAgentDriver:
         carb_settings = carb.settings.get_settings()
         key = "/exts/omni.anim.navigation.core/navMesh/config/agentSamplingDistance"
 
-        base = NAVMESH_SETTINGS["agentSamplingDistance"]
+        # Via effective_navmesh_settings(), not NAVMESH_SETTINGS: the bake sets
+        # this key itself after _apply_navmesh_settings() has run, so reading
+        # the raw dict here would silently discard an environment override and
+        # bake at the default while reporting the override as applied.
+        base = effective_navmesh_settings()["agentSamplingDistance"]
         if extent:
             # Keep the cell count per axis inside what the baker can allocate.
             # ``extent`` is in stage units (metres) but the sampling distance is

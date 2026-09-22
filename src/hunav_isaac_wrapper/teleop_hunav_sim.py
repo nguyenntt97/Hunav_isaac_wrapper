@@ -145,6 +145,7 @@ from .terrain import apply_flat_ground
 from .asset_paths import get_isaac_major
 from .robots import RENDER_DT, get_spec, make_driver, require_available
 from .robots.ros_publishers import RobotStatePublisher
+from .perf import get_profiler
 
 # Default maximum step an agent can climb when --terrain-follow is on, in metres.
 # 0.25 m is about a kerb: on the brownstone terraces (mean 0.43 m, max 0.94 m)
@@ -288,6 +289,12 @@ class TeleopHuNavSim(Node):
         # so the crowd tick is decimated back to the rendering rate.
         self._hunav_decimation = max(1, int(round(RENDER_DT / physics_dt)))
         self._physics_step_count = 0
+
+        # Off unless HUNAV_PERF=1, in which case every span below starts timing.
+        self.perf = get_profiler()
+        self._perf_norender = _env_flag("HUNAV_PERF_NORENDER")
+        if self._perf_norender:
+            print("[perf] HUNAV_PERF_NORENDER=1: stepping with render=False", flush=True)
 
         if map_name == "empty_world":
             self.world.scene.add_default_ground_plane()
@@ -504,6 +511,15 @@ class TeleopHuNavSim(Node):
         --/app/installSignalHandlers=0, so Python's handler is the only one
         there is: if it returns without exiting, the run loop just carries on.
         """
+        # Write the profile first. Both exits below are os._exit(), which skips
+        # atexit handlers, so a run stopped with Ctrl-C -- which is how a timed
+        # measurement run always ends -- would otherwise leave no JSON behind.
+        # dump() is idempotent and a no-op when profiling is off.
+        try:
+            self.perf.dump()
+        except Exception:
+            pass
+
         # A second interrupt means the graceful path is wedged. Leave now.
         if self._shutdown_requested:
             print("\n[hunav] Second interrupt -- exiting immediately.\n", flush=True)
@@ -549,11 +565,17 @@ class TeleopHuNavSim(Node):
         service call and assumes a 20 Hz cadence, so it is decimated back to
         that regardless of how fast physics is running.
         """
-        self.driver.on_physics_step(dt)
+        # This fires once per PhysX substep -- ten times per rendered frame for
+        # the Go2 -- so the profiler sums these spans across the frame rather
+        # than reporting the cost of one substep.
+        with self.perf.span("physx_cb_total"):
+            with self.perf.span("go2_policy"):
+                self.driver.on_physics_step(dt)
 
-        self._physics_step_count += 1
-        if self._physics_step_count % self._hunav_decimation == 0:
-            self.hunav.send_agents_msg()
+            self._physics_step_count += 1
+            if self._physics_step_count % self._hunav_decimation == 0:
+                with self.perf.span("crowd"):
+                    self.hunav.send_agents_msg()
 
     def create_ros_clock_action_graph(self, graph_path="/World/ROS2"):
         try:
@@ -675,18 +697,34 @@ class TeleopHuNavSim(Node):
         locomotion_checked = False
         steps = 0
         while simulation_app.is_running() and not self._shutdown_requested:
-            self.world.step(render=True)
-            steps += 1
-            if not locomotion_checked and steps == 250:
-                locomotion_checked = True
-                try:
-                    self.hunav.report_locomotion_health()
-                except Exception as exc:
-                    print(f"[hunav] locomotion check errored: {exc}", flush=True)
-            self.driver.on_render_step()
-            if self.state_publisher is not None:
-                self.state_publisher.publish()
-            # The node used to be spun only as a side effect of HuNavManager's
-            # blocking service call, which made teleop depend on HuNavSim being
-            # alive. Spin it here so /cmd_vel is serviced on its own.
-            rclpy.spin_once(self, timeout_sec=0.0)
+            with self.perf.frame():
+                with self.perf.span("world_step"):
+                    # HUNAV_PERF_NORENDER=1 steps physics without rendering.
+                    # world.step() is a single opaque call, so this is the only
+                    # way to split the renderer from the PhysX solver -- the
+                    # difference between the two runs is the render. Diagnostic
+                    # only: the viewport does not update.
+                    self.world.step(render=not self._perf_norender)
+                steps += 1
+                if not locomotion_checked and steps == 250:
+                    locomotion_checked = True
+                    try:
+                        self.hunav.report_locomotion_health()
+                    except Exception as exc:
+                        print(f"[hunav] locomotion check errored: {exc}", flush=True)
+                with self.perf.span("driver_render"):
+                    self.driver.on_render_step()
+                if self.state_publisher is not None:
+                    with self.perf.span("ros_publish"):
+                        self.state_publisher.publish()
+                # The node used to be spun only as a side effect of
+                # HuNavManager's blocking service call, which made teleop depend
+                # on HuNavSim being alive. Spin it here so /cmd_vel is serviced
+                # on its own.
+                with self.perf.span("ros_spin"):
+                    rclpy.spin_once(self, timeout_sec=0.0)
+                # Feed the simulated clock so the report can state the real-time
+                # factor. 30 FPS at 0.6x real time and 30 FPS at 1.0x real time
+                # are indistinguishable in an FPS counter and are not the same
+                # result; the target here is the latter.
+                self.perf.note_sim_time(self.world.current_time)

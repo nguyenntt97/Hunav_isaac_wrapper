@@ -28,14 +28,30 @@ except ImportError:
 
 
 # Default settings matching pyrecast specification
+# ov_navmesh's settings dict, kept key-for-key so existing callers keep working.
+# Only the first block maps onto anything omni.anim.navigation.core exposes; see
+# UNSUPPORTED_SETTINGS below for the rest.
 DEFAULT_RECAST_SETTINGS: Dict[str, float] = {
-    "cellSize": 0.3,         # meters
-    "cellHeight": 0.2,       # meters
-    "agentHeight": 2.0,      # meters
-    "agentRadius": 0.6,      # meters
-    "agentMaxClimb": 0.9,    # meters
-    "agentMaxSlope": 45.0,   # degrees
-    "regionMinSize": 8.0,
+    # --- supported: these reach the native baker ---
+    "cellSize": 0.3,         # meters  -> agentSamplingDistance
+    "agentHeight": 2.0,      # meters  -> agentMinHeight
+    "agentRadius": 0.6,      # meters  -> agentMaxRadius
+    "agentMaxClimb": 0.9,    # meters  -> agentMaxStepHeight
+    "agentMaxSlope": 45.0,   # degrees -> agentMaxFloorSlope
+    # --- native-only, no ov_navmesh equivalent ---
+    # The native baker takes a radius *range*, not one radius. Its shipped
+    # defaults are agentMinRadius 20 / agentMaxRadius 50 cm, so the default here
+    # reproduces that 0.4 ratio rather than inventing one.
+    "agentMinRadius": None,       # meters; None -> agentRadius * 0.4
+    "agentMinIslandRadius": 2.0,  # meters; native default is 200 cm
+    "excludeRigidBodies": True,
+    # The GPU baker fails by returning an *empty* navmesh after logging
+    # "CUDA error: out of memory"; the CPU path is the fallback. See
+    # behavior_agent.bake_navmesh.
+    "useGpu": True,
+    # --- accepted for ov_navmesh compatibility, but ignored ---
+    "cellHeight": 0.2,
+    "regionMinSize": 8.0,    # deprecated alias, converted to agentMinIslandRadius
     "regionMergeSize": 20.0,
     "edgeMaxLen": 12.0,
     "edgeMaxError": 1.3,
@@ -44,6 +60,20 @@ DEFAULT_RECAST_SETTINGS: Dict[str, float] = {
     "detailSampleMaxError": 1.0,
     "partitionType": 0.0,
 }
+
+# Recast internals omni.anim.navigation.core does not expose. They were silently
+# accepted and dropped, which made a settings change look like it had no effect;
+# passing one now says so once.
+UNSUPPORTED_SETTINGS = frozenset({
+    "cellHeight",
+    "regionMergeSize",
+    "edgeMaxLen",
+    "edgeMaxError",
+    "vertsPerPoly",
+    "detailSampleDist",
+    "detailSampleMaxError",
+    "partitionType",
+})
 
 # Settings that cause severe CPU sorting stalls when left enabled
 DEBUG_OVERLAY_SETTINGS = (
@@ -80,6 +110,10 @@ class NavmeshInterface:
         self.built = self._navmesh is not None
 
         self.input_prim = None
+        self.input_meshes = []
+        # Settings the volume padding is derived from; build_navmesh refreshes
+        # this with whatever the caller merged in.
+        self.settings = dict(DEFAULT_RECAST_SETTINGS)
         self.input_vert = None
         self.input_tri = None
         self.random_points = None
@@ -134,6 +168,24 @@ class NavmeshInterface:
             carb_settings.set(key, val)
             carb_settings.set(f"/persistent{key}", val)
 
+    def _volume_padding(self) -> Tuple[float, float, float]:
+        """(xy, up, down) padding around the assignment, in metres.
+
+        ov_navmesh has no volume at all -- its bake is bounded purely by the
+        geometry you assign. The volume here is an artefact of the native baker,
+        so it should hug the selection rather than impose a box of its own. It
+        cannot hug it exactly, though: a surface only qualifies as walkable if
+        it has ``agentHeight`` of clearance above it, so the box has to carry
+        that headroom or the bake silently returns nothing. The old fixed +4 m
+        XY / 6 m Z was approximating that without saying so.
+        """
+        settings = getattr(self, "settings", None) or DEFAULT_RECAST_SETTINGS
+        agent_height = float(settings.get("agentHeight", 2.0))
+        agent_radius = float(settings.get("agentRadius", 0.6))
+        max_climb = float(settings.get("agentMaxClimb", 0.9))
+        margin = 0.5
+        return agent_radius + margin, agent_height + margin, max_climb + margin
+
     def ensure_navmesh_volume(self, bounds: Optional[Tuple[Tuple[float, float, float], Tuple[float, float, float]]] = None):
         """Ensure a NavMeshVolume exists on stage covering the target geometry."""
         if not self.stage:
@@ -169,15 +221,18 @@ class NavmeshInterface:
 
         if bounds is not None:
             (min_x, min_y, min_z), (max_x, max_y, max_z) = bounds
+            pad_xy, pad_up, pad_down = self._volume_padding()
+            # Asymmetric in Z, so the centre is not the bbox centre.
+            lo_z, hi_z = min_z - pad_down, max_z + pad_up
             centre = Gf.Vec3d(
                 (min_x + max_x) * 0.5,
                 (min_y + max_y) * 0.5,
-                (min_z + max_z) * 0.5,
+                (lo_z + hi_z) * 0.5,
             )
             scale = Gf.Vec3f(
-                max((max_x - min_x) + 4.0, 2.0),
-                max((max_y - min_y) + 4.0, 2.0),
-                max((max_z - min_z) + 4.0, 6.0),
+                max((max_x - min_x) + 2.0 * pad_xy, 2.0 * pad_xy),
+                max((max_y - min_y) + 2.0 * pad_xy, 2.0 * pad_xy),
+                max(hi_z - lo_z, pad_up + pad_down),
             )
             for name, val in (("xformOp:translate", centre), ("xformOp:scale", scale)):
                 attr = volume.GetAttribute(name)
@@ -194,9 +249,15 @@ class NavmeshInterface:
         points, faces = usd_utils.parent_and_children_as_mesh(prim)
         self.input_vert = points
         self.input_tri = faces
+        # The meshes the assignment actually resolves to. Restricting a bake
+        # needs these prims; the triangle soup above cannot identify them.
+        self.input_meshes = usd_utils.find_stage_meshes(self.stage, [prim])
 
         if len(points) > 0:
-            bounds = usd_utils.compute_bounds([prim], stage=self.stage)
+            # Bound the resolved meshes, not the prim that was passed in: an
+            # Xform root is not Boundable, so compute_bounds returns None for it
+            # and the volume is left at whatever size it happened to have.
+            bounds = usd_utils.compute_bounds(self.input_meshes or [prim], stage=self.stage)
             if bounds:
                 self.ensure_navmesh_volume(bounds)
             return True
@@ -214,7 +275,10 @@ class NavmeshInterface:
             return False
 
         self.input_prim = [self.stage.GetPrimAtPath(p) for p in selected_paths]
-        points, faces = usd_utils.get_all_stage_mesh(self.stage, self.input_prim)
+        # Resolve once and keep the prims: get_all_stage_mesh would re-walk the
+        # same hierarchy and still only hand back triangles.
+        self.input_meshes = usd_utils.find_stage_meshes(self.stage, self.input_prim)
+        points, faces = usd_utils.get_mesh(self.input_meshes)
         self.input_vert = points
         self.input_tri = faces
 
@@ -222,13 +286,37 @@ class NavmeshInterface:
             print("[NavMeshAdapter] No mesh geometry found in selected prims.")
             return False
 
-        bounds = usd_utils.compute_bounds(self.input_prim, stage=self.stage)
+        bounds = usd_utils.compute_bounds(self.input_meshes, stage=self.stage)
         if bounds:
             self.ensure_navmesh_volume(bounds)
         else:
             self.ensure_navmesh_volume()
 
+        self._warn_inverted()
         return True
+
+    def _warn_inverted(self):
+        """Say at assign time which meshes cannot bake as they stand.
+
+        Otherwise the only symptom is a bake that comes back smaller than the
+        selection, which reads as the assignment being ignored and sends people
+        hunting through agent radius and sampling distance -- neither of which
+        can help a surface that faces the wrong way.
+        """
+        try:
+            inverted = self._inverted_assigned()
+        except Exception:
+            return
+        if not inverted:
+            return
+        names = ", ".join(p.GetPath().name for p in inverted[:3])
+        print(
+            f"[NavMeshAdapter] Note: {len(inverted)} of {len(self.input_meshes)} assigned "
+            f"mesh(es) are wound inside-out ({names}{' ...' if len(inverted) > 3 else ''}). "
+            "Every face points down, so the baker reads them as ceilings and no "
+            "agent radius or sampling distance will make them walkable. The bake "
+            "reverses them on the fly; fix the winding in the asset to make it stick."
+        )
 
     @staticmethod
     def _pump(iterations: int = 6):
@@ -236,6 +324,12 @@ class NavmeshInterface:
 
         Baking immediately after MakeInvisible() bakes the *old* visibility --
         the same trap behavior_agent.bake_navmesh documents.
+
+        Never call build_navmesh (and so this) from an omni.ui callback: a
+        Button's clicked_fn runs inside the draw pass, and pumping from there
+        re-enters it and unbalances ImGui's id stack, which segfaults Kit in
+        ImGui::PopID(). ui_window._defer exists to put the bake on the next
+        frame instead.
         """
         try:
             import omni.kit.app
@@ -246,12 +340,44 @@ class NavmeshInterface:
         except Exception:
             pass
 
+    # Visualization prims are real UsdGeom.Mesh geometry with no
+    # NavMeshExcludeAPI, so a bake that can see them voxelises the *previous*
+    # navmesh into the new one.
+    _VISUALIZATION_PREFIXES = ("/World/navmeshmesh", "/World/Outline", "/World/Points", "/World/Path")
+
     def _assigned_paths(self) -> List[str]:
-        """Prim paths currently assigned, as a flat list."""
-        if not self.input_prim:
-            return []
-        prims = self.input_prim if isinstance(self.input_prim, (list, tuple)) else [self.input_prim]
-        return [p.GetPath().pathString for p in prims if p and p.IsValid()]
+        """Prim paths of the meshes the assignment resolved to."""
+        return [p.GetPath().pathString for p in self.input_meshes if p and p.IsValid()]
+
+    def _keep_set(self) -> Tuple[set, set]:
+        """Paths to keep visible during a restricted bake.
+
+        Returns ``(mesh_paths, prototype_paths)``. The second set exists because
+        visibility cannot be authored on an instance proxy -- only on the prim
+        inside the prototype, which every instance shares. An assigned mesh that
+        lives under an instance is therefore kept by its prototype path, which
+        is what a TraverseAll() walk will actually encounter.
+        """
+        mesh_paths, prototype_paths = set(), set()
+        for prim in self.input_meshes:
+            if not prim or not prim.IsValid():
+                continue
+            mesh_paths.add(prim.GetPath().pathString)
+            if not prim.IsInstanceProxy():
+                continue
+            in_prototype = prim.GetPrimInPrototype()
+            if not (in_prototype and in_prototype.IsValid()):
+                continue
+            prototype_paths.add(in_prototype.GetPath().pathString)
+            # An instance proxy is read-only, so its visibility is really the
+            # visibility of the prim the prototype composes from -- and *that*
+            # prim is on the stage proper, where TraverseAll will find and hide
+            # it. Hiding it takes every instance down with it and the bake comes
+            # back empty. The prim stack is the only way back to those source
+            # paths; prototype paths themselves are never traversed.
+            for spec in in_prototype.GetPrimStack():
+                prototype_paths.add(spec.path.pathString)
+        return mesh_paths, prototype_paths
 
     def _hide_unassigned(self) -> List[Usd.Prim]:
         """Hide every visible mesh outside the assignment. Returns what to restore.
@@ -264,24 +390,49 @@ class NavmeshInterface:
         already restricts its own bake, and it is the only lever the native
         baker exposes.
         """
-        keep = self._assigned_paths()
-        if not keep:
+        mesh_paths, prototype_paths = self._keep_set()
+        if not mesh_paths:
             return []
 
+        shared = []
         hidden = []
         # TraverseAll(), not Traverse(): the latter skips instancing prototypes,
         # and instanced vegetation is exactly the geometry that pollutes a bake.
+        # Note this yields prototype prims, never instance proxies -- which is
+        # why _keep_set() translates assigned proxies into prototype paths.
         for prim in self.stage.TraverseAll():
             if not prim.IsA(UsdGeom.Mesh):
                 continue
             path = prim.GetPath().pathString
-            if any(path == k or path.startswith(k + "/") for k in keep):
+            if path in mesh_paths:
+                continue
+            if path in prototype_paths:
+                # Shared prototype: some instances are assigned and some are
+                # not, and one visibility opinion covers them all. Keeping it
+                # bakes the unassigned instances too; say so rather than let it
+                # look like the restriction silently failed.
+                shared.append(path)
+                continue
+            if any(path.startswith(prefix) for prefix in self._VISUALIZATION_PREFIXES):
+                imageable = UsdGeom.Imageable(prim)
+                if imageable.ComputeVisibility() != UsdGeom.Tokens.invisible:
+                    imageable.MakeInvisible()
+                    hidden.append(prim)
                 continue
             imageable = UsdGeom.Imageable(prim)
             if imageable.ComputeVisibility() == UsdGeom.Tokens.invisible:
                 continue
             imageable.MakeInvisible()
             hidden.append(prim)
+
+        if shared:
+            print(
+                "[NavMeshAdapter] Warning: assigned mesh(es) share an instancing "
+                f"prototype with unassigned ones ({', '.join(sorted(shared)[:3])}"
+                f"{' ...' if len(shared) > 3 else ''}). Visibility is per-prototype, "
+                "so those unassigned instances will bake too. Uninstance them to "
+                "restrict the bake exactly."
+            )
         return hidden
 
     @staticmethod
@@ -292,10 +443,190 @@ class NavmeshInterface:
             except Exception:
                 pass
 
+    # A mesh is treated as inside-out when essentially none of its area faces
+    # up and a real share of it faces down. Both halves matter: a vertical wall
+    # also has no up-facing area, but almost no down-facing area either, and
+    # flipping it would be meaningless. Raised walkways in brownstone measure
+    # 20-33% up-facing, so they stay well clear of this.
+    _INVERTED_UP_FRACTION = 0.02
+    _INVERTED_DOWN_FRACTION = 0.30
+
+    @staticmethod
+    def _facing_areas(prim: Usd.Prim) -> Tuple[float, float, float]:
+        """(up, down, total) triangle area of `prim`, in world space.
+
+        Recast decides walkability from the face normal, so this is the number
+        that says whether a mesh can become navmesh at all -- independent of
+        agent radius or sampling, which only trim a surface that already faces
+        the right way.
+        """
+        mesh = UsdGeom.Mesh(prim)
+        points = mesh.GetPointsAttr().Get()
+        counts = mesh.GetFaceVertexCountsAttr().Get()
+        indices = mesh.GetFaceVertexIndicesAttr().Get()
+        if not points or not counts or not indices:
+            return 0.0, 0.0, 0.0
+
+        xform = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+        world = np.array([xform.Transform(Gf.Vec3d(*p)) for p in points], dtype=float)
+        counts = np.asarray(counts, dtype=int)
+        indices = np.asarray(indices, dtype=int)
+
+        up = down = total = 0.0
+        offset = 0
+        for count in counts:
+            face = indices[offset:offset + count]
+            offset += count
+            for k in range(1, count - 1):
+                a, b, c = world[face[0]], world[face[k]], world[face[k + 1]]
+                normal = np.cross(b - a, c - a)
+                area = float(np.linalg.norm(normal)) / 2.0
+                total += area
+                if normal[2] > 0:
+                    up += area
+                elif normal[2] < 0:
+                    down += area
+        return up, down, total
+
+    def _inverted_assigned(self) -> List[Usd.Prim]:
+        """Assigned meshes whose faces all point the wrong way."""
+        inverted = []
+        for prim in self.input_meshes:
+            if not prim or not prim.IsValid() or not prim.IsA(UsdGeom.Mesh):
+                continue
+            try:
+                up, down, total = self._facing_areas(prim)
+            except Exception:
+                continue
+            if total <= 0.0:
+                continue
+            if (up / total) < self._INVERTED_UP_FRACTION and (down / total) > self._INVERTED_DOWN_FRACTION:
+                inverted.append(prim)
+        return inverted
+
+    def _flip_inverted(self) -> List[Usd.Prim]:
+        """Temporarily reverse inside-out assigned meshes. Returns what to undo.
+
+        An inside-out mesh reads as a ceiling, so the bake silently returns
+        nothing for it and no agent radius or sampling distance can recover it
+        -- brownstone ships one such footpath, a mirrored duplicate authored
+        without reversing its winding.
+
+        The reversal is written to the *session* layer, so it never reaches the
+        asset on disk, and it is undone in the caller's finally. Note the baker
+        ignores UsdGeom's `orientation` attribute: setting leftHanded still
+        bakes nothing, so the indices themselves have to be reversed.
+        """
+        inverted = self._inverted_assigned()
+        if not inverted:
+            return []
+
+        flipped, blocked = [], []
+        session = self.stage.GetSessionLayer()
+        for prim in inverted:
+            # Visibility can be authored on a prototype, but geometry cannot be
+            # authored on an instance proxy at all.
+            if prim.IsInstanceProxy():
+                blocked.append(prim.GetPath().pathString)
+                continue
+            try:
+                mesh = UsdGeom.Mesh(prim)
+                counts = list(mesh.GetFaceVertexCountsAttr().Get() or [])
+                indices = list(mesh.GetFaceVertexIndicesAttr().Get() or [])
+                reversed_indices, offset = [], 0
+                for count in counts:
+                    reversed_indices.extend(reversed(indices[offset:offset + count]))
+                    offset += count
+                with Usd.EditContext(self.stage, session):
+                    mesh.GetFaceVertexIndicesAttr().Set(reversed_indices)
+                flipped.append(prim)
+            except Exception as exc:
+                blocked.append(f"{prim.GetPath().pathString} ({exc})")
+
+        if flipped:
+            names = ", ".join(p.GetPath().name for p in flipped[:3])
+            print(
+                f"[NavMeshAdapter] {len(flipped)} assigned mesh(es) are wound "
+                f"inside-out ({names}{' ...' if len(flipped) > 3 else ''}); every face "
+                "points down, so the baker reads them as ceilings. Baking a "
+                "reversed copy for this bake only -- the asset on disk is not "
+                "modified. Fix the winding in the source asset to make this stick."
+            )
+        if blocked:
+            print(
+                f"[NavMeshAdapter] Warning: {len(blocked)} inside-out assigned "
+                f"mesh(es) could not be corrected ({', '.join(blocked[:3])}"
+                f"{' ...' if len(blocked) > 3 else ''}); they will produce no navmesh. "
+                "Geometry cannot be overridden on an instance proxy -- uninstance "
+                "them or fix the winding in the source asset."
+            )
+        return flipped
+
+    def _restore_winding(self, flipped: List[Usd.Prim]):
+        """Drop the session-layer reversal authored by _flip_inverted."""
+        if not flipped:
+            return
+        session = self.stage.GetSessionLayer()
+        for prim in flipped:
+            try:
+                with Usd.EditContext(self.stage, session):
+                    UsdGeom.Mesh(prim).GetFaceVertexIndicesAttr().Clear()
+            except Exception:
+                pass
+            # Clear() drops the value but leaves an empty property spec behind.
+            # It carries no opinion, so composition is already correct -- but it
+            # would pile up in the session layer one bake after another, so take
+            # the spec out too.
+            try:
+                prim_spec = session.GetPrimAtPath(prim.GetPath())
+                if prim_spec is not None and "faceVertexIndices" in prim_spec.properties:
+                    prim_spec.RemoveProperty(prim_spec.properties["faceVertexIndices"])
+            except Exception:
+                pass
+
+    @staticmethod
+    def _warn_unsupported(settings: Optional[Dict[str, Any]]):
+        """Name any Recast-only keys the caller passed that cannot be honoured.
+
+        Only keys explicitly passed are reported -- the defaults carry all eight
+        for ov_navmesh compatibility, and warning about those would be noise.
+        """
+        if not settings:
+            return
+        ignored = sorted(UNSUPPORTED_SETTINGS.intersection(settings))
+        if ignored:
+            print(
+                f"[NavMeshAdapter] Ignoring {', '.join(ignored)}: these are Recast "
+                "internals that omni.anim.navigation.core does not expose. Supported "
+                "keys are cellSize, agentHeight, agentRadius, agentMinRadius, "
+                "agentMaxClimb, agentMaxSlope, agentMinIslandRadius, excludeRigidBodies, useGpu."
+            )
+
+    @staticmethod
+    def _island_radius_cm(settings: Dict[str, Any], to_cm) -> float:
+        """Smallest island to keep, in centimetres.
+
+        Prefers the native parameter. ``regionMinSize`` is ov_navmesh's name for
+        a different quantity -- a linear voxel count that Recast squares into an
+        area (regionMinSize**2 * cellSize**2) -- so when only that is given it is
+        converted by area-equivalence, r = sqrt(area / pi), instead of the
+        arbitrary x10 this used to apply.
+        """
+        explicit = settings.get("agentMinIslandRadius")
+        if explicit is not None and "regionMinSize" not in settings:
+            return to_cm(explicit)
+        if "regionMinSize" in settings:
+            region = float(settings["regionMinSize"])
+            cell = float(settings.get("cellSize", 0.3))
+            side = region * cell                      # metres
+            return to_cm(side / math.sqrt(math.pi))   # equal-area radius
+        return to_cm(explicit if explicit is not None else 2.0)
+
     def build_navmesh(
         self,
         settings: Optional[Dict[str, Any]] = None,
         restrict_to_assigned: bool = True,
+        fix_inverted: bool = True,
     ) -> bool:
         """Configure parameters, suppress debug geometry, and trigger synchronous baking.
 
@@ -310,17 +641,90 @@ class NavmeshInterface:
                 for the duration of the bake. Pass False to bake the whole
                 volume, which is what this did before and what the runtime
                 bake in behavior_agent.py wants.
+            fix_inverted: Bake a reversed copy of any assigned mesh that is
+                wound inside-out, which the baker would otherwise read as a
+                ceiling and skip in silence. Session-layer only; the asset is
+                never modified. Pass False to bake exactly what the scene says.
         """
+        if not self._acquire():
+            return False
+        self._configure_bake(settings)
+        hidden = self._begin_restriction(restrict_to_assigned)
+        flipped = self._flip_inverted() if fix_inverted else []
+        if hidden or flipped:
+            self._pump()
+        try:
+            self.inav.start_navmesh_baking_and_wait()
+        finally:
+            self._restore_winding(flipped)
+            if hidden:
+                self._restore(hidden)
+            if hidden or flipped:
+                self._pump(2)
+        return self._conclude_bake()
+
+    async def build_navmesh_async(
+        self,
+        settings: Optional[Dict[str, Any]] = None,
+        restrict_to_assigned: bool = True,
+        fix_inverted: bool = True,
+    ) -> bool:
+        """The same bake, awaiting frames instead of pumping them.
+
+        Anything running on Kit's asyncio loop must use this. ``app.update()``
+        drives that loop (omni.kit.async_engine calls ``loop.run_once()`` on
+        each update event), so pumping from inside a coroutine re-enters the
+        loop while that coroutine is still on it -- every other pending task
+        then dies with "Cannot enter into task ... while another task is being
+        executed", and the loop itself ends up raising IndexError out of an
+        empty ready-deque.
+
+        The bake call is left blocking: it joins a worker rather than pumping,
+        so it does not re-enter the loop, and awaiting it instead would mean
+        polling is_navmesh_baking() across frames with a start-up race to get
+        wrong for no gain.
+        """
+        import omni.kit.app
+
+        if not self._acquire():
+            return False
+        self._configure_bake(settings)
+        hidden = self._begin_restriction(restrict_to_assigned)
+        flipped = self._flip_inverted() if fix_inverted else []
+
+        async def _settle(frames: int = 6):
+            for _ in range(frames):
+                await omni.kit.app.get_app().next_update_async()
+
+        try:
+            if hidden or flipped:
+                await _settle()
+            self.inav.start_navmesh_baking_and_wait()
+        finally:
+            self._restore_winding(flipped)
+            if hidden:
+                self._restore(hidden)
+            if hidden or flipped:
+                await _settle(2)
+        return self._conclude_bake()
+
+    def _acquire(self) -> bool:
+        """Make sure the navigation interface is in hand."""
         if not self.inav:
             if nav:
                 self.inav = nav.acquire_interface()
             else:
                 print("[NavMeshAdapter] Error: navigation core interface not available.")
                 return False
+        return True
 
+    def _configure_bake(self, settings: Optional[Dict[str, Any]]) -> None:
+        """Push settings to carb and make sure the volume exists."""
         merged_settings = dict(DEFAULT_RECAST_SETTINGS)
         if settings:
             merged_settings.update(settings)
+        self.settings = merged_settings
+        self._warn_unsupported(settings)
 
         self.suppress_debug_geometry()
 
@@ -338,35 +742,48 @@ class NavmeshInterface:
         agent_climb_cm = to_cm(merged_settings["agentMaxClimb"])
         agent_slope_deg = float(merged_settings["agentMaxSlope"])
 
+        # The native baker takes a radius range. Its shipped defaults are
+        # agentMinRadius 20 / agentMaxRadius 50 cm, so falling back to 0.4 of the
+        # max reproduces the ratio NVIDIA ships rather than inventing one.
+        min_radius = merged_settings.get("agentMinRadius")
+        min_radius_cm = agent_radius_cm * 0.4 if min_radius is None else to_cm(min_radius)
+
+        island_radius_cm = self._island_radius_cm(merged_settings, to_cm)
+
         carb_settings.set(f"{prefix}/agentSamplingDistance", cell_size_cm)
         carb_settings.set(f"{prefix}/agentMinHeight", agent_height_cm)
         carb_settings.set(f"{prefix}/agentMaxRadius", agent_radius_cm)
-        carb_settings.set(f"{prefix}/agentMinRadius", agent_radius_cm * 0.4)
+        carb_settings.set(f"{prefix}/agentMinRadius", min_radius_cm)
         carb_settings.set(f"{prefix}/agentMaxStepHeight", agent_climb_cm)
         carb_settings.set(f"{prefix}/agentMaxFloorSlope", agent_slope_deg)
-        carb_settings.set(f"{prefix}/agentMinIslandRadius", float(merged_settings.get("regionMinSize", 8.0)) * 10.0)
-        carb_settings.set(f"{prefix}/excludeRigidBodies", True)
+        carb_settings.set(f"{prefix}/agentMinIslandRadius", island_radius_cm)
+        carb_settings.set(f"{prefix}/excludeRigidBodies",
+                          bool(merged_settings.get("excludeRigidBodies", True)))
+        # useGpu lives outside the config subtree.
+        carb_settings.set("/exts/omni.anim.navigation.core/navMesh/useGpu",
+                          bool(merged_settings.get("useGpu", True)))
 
         # Ensure volume exists if not already present
         self.ensure_navmesh_volume()
 
-        # Trigger bake. When meshes have been assigned, restrict the bake to
-        # them -- otherwise the volume's whole interior bakes as walkable.
         print(f"[NavMeshAdapter] Baking NavMesh (sampling={cell_size_cm:.1f}cm, height={agent_height_cm:.1f}cm, radius={agent_radius_cm:.1f}cm)...")
-        hidden = []
-        if restrict_to_assigned:
-            hidden = self._hide_unassigned()
-            if hidden:
-                print(f"[NavMeshAdapter] Restricting bake to {len(self._assigned_paths())} "
-                      f"assigned mesh(es); {len(hidden)} other mesh(es) hidden.")
-                self._pump()
-        try:
-            success = self.inav.start_navmesh_baking_and_wait()
-        finally:
-            if hidden:
-                self._restore(hidden)
-                self._pump(2)
 
+    def _begin_restriction(self, restrict_to_assigned: bool) -> List[Usd.Prim]:
+        """Hide everything outside the assignment; returns what was hidden.
+
+        The caller has to let the hide settle (pump or await) before baking,
+        and must restore the returned prims afterwards.
+        """
+        if not restrict_to_assigned:
+            return []
+        hidden = self._hide_unassigned()
+        if hidden:
+            print(f"[NavMeshAdapter] Restricting bake to {len(self._assigned_paths())} "
+                  f"assigned mesh(es); {len(hidden)} other mesh(es) hidden.")
+        return hidden
+
+    def _conclude_bake(self) -> bool:
+        """Pick up whatever the bake produced and report it."""
         self._navmesh = self.inav.get_navmesh()
         self.built = (self._navmesh is not None)
 

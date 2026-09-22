@@ -106,6 +106,67 @@ if [ "${HUNAV_NAVMESH_HELPER:-0}" = "1" ] || [ "${NAVMESH_HELPER:-0}" = "1" ] ||
     fi
 fi
 
+
+# Report HuNav nodes left over from a previous run.
+#
+# initialize_hunav_nodes() starts hunav_loader, hunav_agent_manager and
+# hunav_evaluator_node as subprocesses. A hard kill of Isaac Sim (Ctrl-C twice,
+# a crash, a closed terminal) orphans them, and they keep running for days.
+# They are not merely idle: the container is network_mode: host on the default
+# ROS_DOMAIN_ID, so every orphaned hunav_agent_manager still advertises
+# /compute_agents. A new run's call_async can then be answered by a node holding
+# a different scenario's agent state, and DDS discovery across the accumulated
+# participants taxes every publish in the render loop.
+#
+# Killing them is NOT the default: an orphan is indistinguishable from a node
+# someone is deliberately running, and this script has no way to tell them
+# apart. The default is to say so and carry on.
+#
+#   HUNAV_STALE_NODES=warn   (default) report and continue
+#   HUNAV_STALE_NODES=reap             terminate them, then continue
+#   HUNAV_STALE_NODES=abort            refuse to launch
+#   HUNAV_STALE_NODES=ignore           do not even look
+#
+# The [a] brackets keep the pattern from matching this script's own command line.
+_HUNAV_STALE_PATTERN='hunav_[a]gent_manager|hunav_[l]oader|hunav_[e]valuator_node'
+_HUNAV_STALE_MODE="${HUNAV_STALE_NODES:-warn}"
+# Deprecated alias, kept so anything already setting it keeps working.
+if [ -n "${HUNAV_REAP_STALE:-}" ]; then
+    if [ "${HUNAV_REAP_STALE}" = "1" ]; then _HUNAV_STALE_MODE="reap"; else _HUNAV_STALE_MODE="abort"; fi
+fi
+
+if [ "$1" != "--help" ] && [ "$1" != "-h" ] && [ "$_HUNAV_STALE_MODE" != "ignore" ]; then
+    _stale_count=$(pgrep -fc "$_HUNAV_STALE_PATTERN" 2>/dev/null || echo 0)
+    if [ "${_stale_count:-0}" -gt 0 ]; then
+        echo -e "${YELLOW}Found $_stale_count leftover HuNav node(s) from a previous run.${NC}"
+        echo "They advertise /compute_agents on this ROS domain; this run's service"
+        echo "calls may be answered by one of them instead of the nodes it starts."
+        case "$_HUNAV_STALE_MODE" in
+            reap)
+                echo "HUNAV_STALE_NODES=reap: terminating them."
+                pkill -f "$_HUNAV_STALE_PATTERN" 2>/dev/null || true
+                sleep 1
+                pkill -9 -f "$_HUNAV_STALE_PATTERN" 2>/dev/null || true
+                _left=$(pgrep -fc "$_HUNAV_STALE_PATTERN" 2>/dev/null || echo 0)
+                if [ "${_left:-0}" -gt 0 ]; then
+                    echo -e "${YELLOW}Warning: $_left HuNav node(s) survived.${NC}"
+                else
+                    echo -e "${GREEN}Leftover HuNav nodes cleared.${NC}"
+                fi
+                ;;
+            abort)
+                echo "HUNAV_STALE_NODES=abort: refusing to launch."
+                echo "  pkill -f 'hunav_agent_manager|hunav_loader|hunav_evaluator_node'"
+                exit 1
+                ;;
+            *)
+                echo "Continuing anyway (HUNAV_STALE_NODES=reap to clear them first,"
+                echo "abort to refuse, ignore to skip this check)."
+                ;;
+        esac
+    fi
+fi
+
 # Parse arguments
 if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
     echo "HuNav Isaac Wrapper Launcher"
@@ -131,6 +192,13 @@ if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
     echo "  LIVESTREAM_PUBLIC_IP=<IP>                # Announce public IP to WebRTC clients"
     echo "  HUNAV_CROWD_PROFILING=1                  # Print per-frame crowd update timings"
     echo "  HUNAV_ANIM_DEBUG=1                       # Print debug logs for agent animations"
+    echo "  HUNAV_PERF=1                             # Per-frame timing breakdown (FPS, p50/p95 per phase)"
+    echo "  HUNAV_PERF_EVERY=2.0                     # Seconds between HUNAV_PERF reports (default 2.0)"
+    echo "  HUNAV_STALE_NODES=warn|reap|abort|ignore # Leftover HuNav nodes from a previous run"
+    echo "                                           #   (default warn: report them and continue)"
+    echo "  HUNAV_NAVMESH_AGENTSAMPLINGDISTANCE=<cm> # Navmesh sampling distance (default 20; coarser = faster)"
+    echo "  HUNAV_NAVMESH_USEGPU=0|1                 # GPU navmesh path (default: plugin default, on)"
+    echo "  HUNAV_NO_DRIVE=1                         # Diagnostic: spawn agents but never give them goals"
     echo ""
     echo "Examples:"
     echo "  $0                                      # Show interactive menu"
